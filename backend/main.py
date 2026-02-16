@@ -1,90 +1,135 @@
+import os
+import json
+import asyncio
+import time
+from typing import Optional 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import shutil
-import whisper
-from moviepy import VideoFileClip
+from pypdf import PdfReader
+from io import BytesIO
 from dotenv import load_dotenv
 import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
 
-# 1. Load Environment Variables (The Key)
+# 1. Load Environment Variables
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Check if the key is found
-if not API_KEY:
-    print("❌ ERROR: API Key not found! Check your .env file.")
-else:
-    print("✅ API Key found. Configuring Gemini...")
-    genai.configure(api_key=API_KEY)
-
-# 2. Initialize App
+# 2. Setup App
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. Setup Folders
-UPLOAD_DIR = "temp_uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# 3. Memory for Context
+user_context = {
+    "job_role": "Software Engineer", 
+    "resume_text": ""
+}
 
-print("Loading Whisper model...")
-model = whisper.load_model("base")
-print("Whisper ready!")
-
-@app.post("/process-video")
-async def process_video(file: UploadFile = File(...)):
-    video_path = f"{UPLOAD_DIR}/{file.filename}"
-    audio_path = video_path.replace(".mp4", ".wav").replace(".webm", ".wav")
+# --- ROUTE 1: SETUP (Resume is OPTIONAL now) ---
+@app.post("/upload_resume")
+async def upload_resume(job_role: str = Form(...), file: Optional[UploadFile] = File(None)):
+    print(f"📄 Receiving setup for role: {job_role}")
     
     try:
-        # 1. Save Video
-        with open(video_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        user_context["job_role"] = job_role
         
-        # 2. Extract Audio
-        video_clip = VideoFileClip(video_path)
-        video_clip.audio.write_audiofile(audio_path, logger=None)
-        video_clip.close()
-
-        # 3. Transcribe
-        result = model.transcribe(audio_path)
-        user_text = result["text"]
-
-        # 4. Analyze
-        prompt = f"""
-        You are an expert interview coach. 
-        The candidate said: "{user_text}"
-        
-        1. Give a rating out of 100 based on clarity and confidence.
-        2. Provide one specific tip to improve.
-        3. Generate a follow-up interview question.
-        
-        Return JSON: {{ "rating": 0, "feedback": "...", "follow_up_question": "..." }}
-        """
-        
-        gemini_model = genai.GenerativeModel("gemini-flash-latest")
-        response = gemini_model.generate_content(prompt)
-        ai_feedback = response.text.replace("```json", "").replace("```", "")
-
-        return {
-            "transcript": user_text,
-            "ai_analysis": ai_feedback
-        }
+        if file:
+            # Case A: User uploaded a resume
+            content = await file.read()
+            pdf_reader = PdfReader(BytesIO(content))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+            
+            # Limit text to avoid token limits
+            user_context["resume_text"] = text[:2000]
+            print(f"✅ Resume Parsed for {job_role}")
+        else:
+            # Case B: No resume provided
+            user_context["resume_text"] = "No resume provided. Focus strictly on general competency for the role."
+            print(f"⚠️ No Resume provided. Setting context for {job_role} only.")
+            
+        return {"status": "success", "message": "Context updated"}
 
     except Exception as e:
-        return {"error": str(e)}
+        print(f"❌ Error processing setup: {e}")
+        return {"status": "error", "message": str(e)}
 
-    finally:
-        # --- THE CLEANUP CREW ---
-        # This runs even if the code crashes, keeping your server clean.
-        if os.path.exists(video_path):
-            os.remove(video_path)
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        print("🧹 Cleaned up temporary files.")
+# --- ROUTE 2: VIDEO PROCESSING ---
+@app.post("/process-video")
+async def process_video(file: UploadFile = File(...), question: str = Form("Tell me about yourself")):
+    print(f"🎥 Processing Real AI Analysis for: {question}")
+
+    try:
+        # 1. Save video temporarily
+        temp_filename = "temp_video.webm"
+        with open(temp_filename, "wb") as buffer:
+            buffer.write(await file.read())
+
+        # 2. Configure Gemini
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"error": "Missing API Key"}
+
+        genai.configure(api_key=api_key)
+        
+        # Use the Stable Model
+        model = genai.GenerativeModel(model_name="gemini-flash-latest")
+        
+        print("☁️ Uploading video...")
+        video_file = genai.upload_file(temp_filename)
+        
+        # Wait for processing
+        while video_file.state.name == "PROCESSING":
+            await asyncio.sleep(1)
+            video_file = genai.get_file(video_file.name)
+
+        if video_file.state.name == "FAILED":
+            raise ValueError("Video processing failed on Google's side.")
+
+        # 3. Generate Content with RETRY LOGIC
+        print("🧠 Asking AI...")
+        
+        prompt = f"""
+        You are an Interview Coach. The user is answering: "{question}".
+        Target Role: {user_context['job_role']}
+        Resume Context: {user_context['resume_text']}
+        
+        Analyze the video answer. 
+        CRITICAL: Return ONLY valid JSON. No markdown.
+        Structure:
+        {{
+            "rating": (integer 1-100),
+            "feedback": (string, 2-3 sentences),
+            "improved_answer": (string, how to say it better),
+            "follow_up_question": (string, a relevant next question based on the role)
+        }}
+        """
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content([video_file, prompt])
+                break 
+            except ResourceExhausted:
+                if attempt < max_retries - 1:
+                    print(f"⚠️ Quota hit. Waiting 5 seconds... (Attempt {attempt+1})")
+                    time.sleep(5)
+                else:
+                    raise Exception("Daily Quota Exceeded. Please try again tomorrow.")
+
+        # 4. Clean Response
+        text_response = response.text.replace("```json", "").replace("```", "").strip()
+        print(f"✅ AI Success! Rating: {json.loads(text_response).get('rating')}")
+        
+        return {"ai_analysis": json.loads(text_response)}
+
+    except Exception as e:
+        print(f"❌ ERROR: {e}")
+        return {"status": "error", "message": str(e)}
