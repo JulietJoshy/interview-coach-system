@@ -231,3 +231,172 @@ async def process_video(file: UploadFile = File(...), question: str = Form("Tell
     except Exception as e:
         print(f"❌ ERROR: {e}")
         return {"status": "error", "message": str(e)}
+
+# --- ROUTE 3: GENERATE BOOTCAMP PLAN ---
+@app.post("/generate_bootcamp_plan")
+async def generate_bootcamp_plan(
+    job_role: str = Form(...),
+    days: int = Form(...),
+    resume_text: str = Form("")
+):
+    """Generate a personalized N-day interview preparation roadmap."""
+    print(f"🗓️ Generating {days}-day bootcamp plan for: {job_role}")
+
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"status": "error", "message": "Missing API Key"}
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name="gemini-flash-latest")
+
+        resume_context = f"\nCandidate Resume:\n{resume_text[:1500]}" if resume_text else ""
+
+        day_templates = {
+            1: "HR & Behavioral questions (Tell me about yourself, strengths/weaknesses, teamwork, conflict resolution)",
+            2: "Core Technical Concepts relevant to the role (fundamentals, theory, commonly tested topics)",
+            3: "Problem Solving & Scenario-Based questions (real-world challenges, how they'd handle situations)",
+            4: "Advanced Technical & Project-Based questions (deep dives, architecture, past projects, edge cases)",
+            5: "Full Mock Interview — mix of all above, simulating a real interview end-to-end"
+        }
+
+        actual_days = min(days, 5)
+        days_plan = []
+        for d in range(1, actual_days + 1):
+            days_plan.append(f"Day {d}: {day_templates.get(d, day_templates[5])}")
+
+        prompt = f"""
+You are an expert interview coach creating a personalized preparation plan.
+
+Target Role: {job_role}
+Days Until Interview: {actual_days}
+{resume_context}
+
+Generate a {actual_days}-day interview preparation roadmap. For each day, provide:
+- A short title (5 words max)
+- A focus description (1 sentence)
+- Exactly 5 interview questions tailored to that day's theme and the target role
+
+Day themes to follow:
+{chr(10).join(days_plan)}
+
+CRITICAL: Return ONLY valid JSON in this exact structure, no markdown:
+{{
+  "role": "{job_role}",
+  "total_days": {actual_days},
+  "plan": [
+    {{
+      "day": 1,
+      "title": "Day Title Here",
+      "focus": "What this day focuses on",
+      "questions": ["Q1?", "Q2?", "Q3?", "Q4?", "Q5?"]
+    }}
+  ]
+}}
+"""
+        try:
+            response = model.generate_content(prompt)
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            plan_data = json.loads(text)
+            print(f"✅ Bootcamp plan generated for {actual_days} days")
+            return {"status": "success", "plan": plan_data}
+        except ResourceExhausted:
+            return {"status": "error", "message": "API quota exceeded. Try again later."}
+        except Exception as e:
+            print(f"⚠️ Plan generation error: {e}")
+            return {"status": "error", "message": str(e)}
+
+    except Exception as e:
+        print(f"❌ Bootcamp plan error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# --- ROUTE 4: PROCESS BOOTCAMP ANSWER ---
+@app.post("/process_bootcamp_answer")
+async def process_bootcamp_answer(
+    file: UploadFile = File(...),
+    question: str = Form("Tell me about yourself"),
+    day: int = Form(1),
+    job_role: str = Form("Software Engineer")
+):
+    """Process a bootcamp day answer — same AI analysis but with day context."""
+    print(f"🎓 Processing bootcamp Day {day} answer for: {question}")
+
+    try:
+        temp_filename = f"temp_bootcamp_day{day}.webm"
+        with open(temp_filename, "wb") as buffer:
+            buffer.write(await file.read())
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"error": "Missing API Key"}
+
+        genai.configure(api_key=api_key)
+
+        async def run_gemini_bootcamp():
+            model = genai.GenerativeModel(model_name="gemini-flash-latest")
+            print("☁️ Uploading bootcamp video to Gemini...")
+            video_file = genai.upload_file(temp_filename)
+
+            while video_file.state.name == "PROCESSING":
+                await asyncio.sleep(1)
+                video_file = genai.get_file(video_file.name)
+
+            if video_file.state.name == "FAILED":
+                raise ValueError("Video processing failed.")
+
+            prompt = f"""
+You are an Interview Coach evaluating a Day {day} bootcamp practice session.
+Role: {job_role}
+Question: "{question}"
+
+Analyze the video response. Return ONLY valid JSON, no markdown:
+{{
+  "rating": (integer 1-100),
+  "feedback": (2-3 sentences of specific feedback),
+  "improved_answer": (how to say it better),
+  "follow_up_question": (a relevant next question for this role)
+}}
+"""
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = model.generate_content([video_file, prompt])
+                    break
+                except ResourceExhausted:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5)
+                    else:
+                        raise Exception("Quota exceeded. Try again tomorrow.")
+
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+
+        async def run_emotion_bootcamp():
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                emotion_analyzer.analyze_video_with_eye_tracking,
+                temp_filename
+            )
+
+        ai_data, combined_data = await asyncio.gather(
+            run_gemini_bootcamp(),
+            run_emotion_bootcamp()
+        )
+
+        return {
+            "ai_analysis": ai_data,
+            "emotion_analysis": combined_data.get("emotion_analysis", {}),
+            "eye_tracking": combined_data.get("eye_tracking", {}),
+            "drowsiness": combined_data.get("drowsiness", {})
+        }
+
+    except Exception as e:
+        print(f"❌ Bootcamp answer error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

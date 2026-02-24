@@ -254,5 +254,5 @@ class EyeTracker:
     
     def __del__(self):
         """Cleanup"""
-        if hasattr(self, 'face_mesh'):
+        if hasattr(self, 'face_mesh') and self.face_mesh is not None:
             self.face_mesh.close()
