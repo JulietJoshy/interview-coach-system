@@ -34,7 +34,7 @@ moviepy==2.2.1
 mpmath==1.3.0
 networkx==3.6.1
 numba==0.63.1
-numpy<2
+numpy
 openai-whisper==20250625
 pillow==11.3.0
 proglog==0.1.12
