@@ -322,30 +322,18 @@ class EmotionAnalyzer:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # --- Eye Tracking (MediaPipe) ---
-            eye_result = self.eye_tracker.process_frame(rgb_frame, frame.shape)
-            mp_landmarks = None
-
-            if eye_result is not None:
-                eye_frames_with_face += 1
-                mp_landmarks = eye_result["landmarks"]
-
-                if eye_result["looking_at_camera"]:
-                    eye_center_frames += 1
-                    eye_consecutive_away = 0
-                else:
-                    eye_consecutive_away += 1
-                    if eye_consecutive_away == 5:
-                        eye_looking_away_events.append(frame_count)
-
-            # --- Drowsiness Detection (reuse landmarks) ---
+            # --- Drowsiness Detection runs FIRST (it reliably detects faces) ---
+            # Pass mp_landmarks=None so it uses its own FaceLandmarker to detect
             drowsy_result = self.drowsiness_detector.process_frame(
-                gray, rgb_frame, mp_landmarks, frame.shape
+                gray, rgb_frame, None, frame.shape
             )
+            shared_landmarks = None  # Will be populated after drowsiness detection
 
             if drowsy_result is not None:
                 ear_values.append(drowsy_result["ear"])
                 total_eye_frames += 1
+                # Grab landmarks from drowsiness detector for eye tracking reuse
+                shared_landmarks = drowsy_result.get("landmarks")
 
                 if drowsy_result["eyes_closed"]:
                     frames_eyes_closed += 1
@@ -364,6 +352,21 @@ class EmotionAnalyzer:
                         yawn_count += 1
                 else:
                     consecutive_yawn = 0
+
+            # --- Eye Tracking: reuse landmarks from DrowsinessDetector ---
+            if shared_landmarks is not None:
+                eye_result = self.eye_tracker.analyze_gaze_from_landmarks(
+                    shared_landmarks, frame.shape
+                )
+                if eye_result is not None:
+                    eye_frames_with_face += 1
+                    if eye_result["looking_at_camera"]:
+                        eye_center_frames += 1
+                        eye_consecutive_away = 0
+                    else:
+                        eye_consecutive_away += 1
+                        if eye_consecutive_away == 3:  # Reduced: ~0.6s of looking away counts
+                            eye_looking_away_events.append(frame_count)
 
             # --- Emotion Detection (shared face detection) ---
             face_rect = self._detect_face(frame, gray)

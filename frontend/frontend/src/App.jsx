@@ -12,12 +12,14 @@ const App = () => {
   // Bootcamp state
   const [bootcampPlan, setBootcampPlan] = useState(null);
   const [bootcampRole, setBootcampRole] = useState("");
+  const [bootcampResumeQuestions, setBootcampResumeQuestions] = useState([]);
   const [completedDays, setCompletedDays] = useState([]);
   const [activeDay, setActiveDay] = useState(null);
 
-  const handlePlanGenerated = (plan, role) => {
+  const handlePlanGenerated = (plan, role, resumeQs = []) => {
     setBootcampPlan(plan);
     setBootcampRole(role);
+    setBootcampResumeQuestions(resumeQs);
     setCompletedDays([]);
     setMode("bootcamp-roadmap");
   };
@@ -36,6 +38,7 @@ const App = () => {
   const goHome = () => {
     setMode("home");
     setBootcampPlan(null);
+    setBootcampResumeQuestions([]);
     setCompletedDays([]);
     setActiveDay(null);
   };
@@ -80,7 +83,6 @@ const App = () => {
                 <span className="mode-card-btn">Start Session →</span>
               </div>
               <div className="mode-card mode-card-featured" onClick={() => setMode("bootcamp-setup")}>
-                <div className="mode-card-badge">NEW</div>
                 <div className="mode-card-icon">🚀</div>
                 <h3>AI Interview Bootcamp</h3>
                 <p>Get a personalized 1–5 day roadmap. Structured prep with daily goals and unlock system.</p>
@@ -118,6 +120,7 @@ const App = () => {
           <BootcampDay
             dayItem={activeDay}
             jobRole={bootcampRole}
+            resumeQuestions={bootcampResumeQuestions}
             onDayComplete={handleDayComplete}
             onBack={() => setMode("bootcamp-roadmap")}
           />

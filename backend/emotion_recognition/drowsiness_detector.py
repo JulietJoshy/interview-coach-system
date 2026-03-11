@@ -3,6 +3,17 @@ import numpy as np
 from scipy.spatial import distance as dist
 import os
 
+# Try to use MediaPipe Tasks API (0.10.x+)
+_MEDIAPIPE_AVAILABLE = False
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision as mp_vision
+    from mediapipe.tasks.python.vision import FaceLandmarkerOptions
+    _MEDIAPIPE_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ DrowsinessDetector: MediaPipe not available: {e}")
+
 class DrowsinessDetector:
     """
     Drowsiness detection using Eye Aspect Ratio (EAR) and Mouth Aspect Ratio (MAR).
@@ -11,9 +22,9 @@ class DrowsinessDetector:
 
     # EAR and MAR thresholds
     EAR_THRESHOLD = 0.25       # Below this = eyes closing (default, can be calibrated)
-    MAR_THRESHOLD = 0.40       # Above this = yawning
+    MAR_THRESHOLD = 0.30       # Above this = yawning (genuine yawn; normal speech stays below 0.5)
     CONSECUTIVE_FRAMES = 3     # Frames below threshold to count as blink/drowsy
-    YAWN_CONSECUTIVE = 2       # Frames above MAR threshold to count as yawn
+    YAWN_CONSECUTIVE = 8       # Frames above MAR threshold to count as yawn (~1.5s sustained at skip=6)
 
     # MediaPipe landmark indices for EAR/MAR calculation
     MP_LEFT_EYE = [33, 160, 158, 133, 153, 144]   # p1-p6
@@ -21,26 +32,55 @@ class DrowsinessDetector:
     MP_INNER_MOUTH = [78, 81, 13, 311, 308, 402, 14, 82]  # 8 inner lip points
 
     def __init__(self):
-        """Initialize drowsiness detector with MediaPipe, dlib, or fallback to OpenCV"""
+        """Initialize drowsiness detector with MediaPipe Tasks API, dlib, or fallback to OpenCV"""
         self.use_dlib = False
         self.use_mediapipe = False
+        self.face_landmarker = None
         self.detector = None
         self.predictor = None
 
-        # MediaPipe Face Mesh as primary detector
-        try:
-            import mediapipe as mp_lib
-            mp_face_mesh = mp_lib.solutions.face_mesh if hasattr(mp_lib, 'solutions') else None
-            if mp_face_mesh is not None:
-                self.mp_face_mesh = mp_face_mesh.FaceMesh(
-                    max_num_faces=1,
-                    refine_landmarks=True,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5
-                )
-                self.use_mediapipe = True
-                print("✅ Drowsiness Detector: Using MediaPipe Face Mesh (primary)")
-        except ImportError:
+        # MediaPipe Tasks API as primary detector
+        if _MEDIAPIPE_AVAILABLE:
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'face_landmarker.task')
+            if os.path.exists(model_path):
+                try:
+                    base_opts = mp_tasks.BaseOptions(model_asset_path=model_path)
+                    options = FaceLandmarkerOptions(
+                        base_options=base_opts,
+                        output_face_blendshapes=False,
+                        output_facial_transformation_matrixes=False,
+                        num_faces=1,
+                        min_face_detection_confidence=0.5,
+                        min_face_presence_confidence=0.5,
+                        min_tracking_confidence=0.5,
+                        running_mode=mp_vision.RunningMode.IMAGE,
+                    )
+                    self.face_landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+                    self.use_mediapipe = True
+                    print("✅ Drowsiness Detector: Using MediaPipe Tasks FaceLandmarker (primary)")
+
+                    # ── Suppress mediapipe 0.10.x shutdown crash ──────────────
+                    # __del__ is looked up on the *type*, not the instance.
+                    # By swapping the instance's __class__ to a subclass with a
+                    # no-op __del__, Python GC never triggers the broken
+                    # serial_dispatcher → dispatcher_wrapper crash path.
+                    try:
+                        class _SafeFaceLandmarker(mp_vision.FaceLandmarker):
+                            def __del__(self):
+                                pass  # suppress the mediapipe 0.10.x crash
+                        self.face_landmarker.__class__ = _SafeFaceLandmarker
+                    except Exception:
+                        pass
+
+                except BaseException as e:
+                    # mediapipe 0.10.x C-extension can raise TypeError (not just Exception)
+                    # during create_from_options in some environments — catch everything
+                    print(f"⚠️ Drowsiness: FaceLandmarker init failed ({type(e).__name__}): {e}")
+                    self.face_landmarker = None
+                    self.use_mediapipe = False
+            else:
+                print(f"⚠️ Drowsiness: face_landmarker.task not found")
+        else:
             print("⚠️ MediaPipe not available for drowsiness detection.")
 
         # dlib as secondary
@@ -169,7 +209,7 @@ class DrowsinessDetector:
         MAR = (|p2-p8| + |p3-p7| + |p4-p6|) / (3 * |p1-p5|)
 
         When mouth is closed: MAR ≈ 0.1-0.2
-        When yawning: MAR > 0.6
+        When yawning: MAR > 0.3
         """
         # Vertical distances (inner lip points)
         A = dist.euclidean(mouth_points[1], mouth_points[7])
@@ -228,15 +268,21 @@ class DrowsinessDetector:
                 "ear": avg_ear,
                 "mar": mar,
                 "eyes_closed": eyes_closed,
-                "yawning": yawning
+                "yawning": yawning,
+                "landmarks": landmarks  # pass-through so caller can reuse
             }
 
-        # Fallback: use MediaPipe internally
-        if self.use_mediapipe:
-            results = self.mp_face_mesh.process(rgb_frame)
-            if results.multi_face_landmarks:
-                mp_landmarks = results.multi_face_landmarks[0].landmark
-                return self.process_frame(gray, rgb_frame, mp_landmarks, frame_shape)
+        # Fallback: use MediaPipe Tasks API internally
+        if self.use_mediapipe and self.face_landmarker is not None:
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                result = self.face_landmarker.detect(mp_image)
+                if result.face_landmarks and len(result.face_landmarks) > 0:
+                    mp_landmarks = result.face_landmarks[0]
+                    # Pass landmarks so recursive call includes them in result
+                    return self.process_frame(gray, rgb_frame, mp_landmarks, frame_shape)
+            except Exception as e:
+                print(f"⚠️ Drowsiness detect error: {e}")
 
         # Fallback: dlib
         if self.use_dlib and self.detector and self.predictor:
@@ -412,7 +458,7 @@ class DrowsinessDetector:
                             mar_approx = mh / (mw + 0.001)
                             mar_values.append(mar_approx)
 
-                            # Yawn: mouth is open wide (height > 50% of width)
+                            # Yawn: mouth is open very wide (genuine yawn, not just talking)
                             if mar_approx > self.MAR_THRESHOLD:
                                 consecutive_yawn += 1
                                 if consecutive_yawn == self.YAWN_CONSECUTIVE:

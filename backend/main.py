@@ -2,23 +2,46 @@ import os
 import json
 import asyncio
 import time
-from typing import Optional 
+from typing import Optional
+from dotenv import load_dotenv
+
+# Load environment variables FIRST before anything else
+# override=True ensures a changed .env is picked up on uvicorn reload
+load_dotenv(override=True)
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from io import BytesIO
-from dotenv import load_dotenv
-import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted
+from google import genai
+from google.genai import types as genai_types
 from emotion_recognition.inference import EmotionAnalyzer
+import atexit
 
 # Initialize Emotion Analyzer
 emotion_analyzer = EmotionAnalyzer()
 
-# 1. Load Environment Variables
-load_dotenv()
+def _cleanup():
+    """Prevent the mediapipe 0.10.x FaceLandmarker __del__ shutdown crash.
 
-# 2. Setup App
+    mediapipe's close() method starts with 'if not self._handle: return'.
+    By setting _handle and _lib to None before Python GC runs, __del__ → close()
+    hits the early-return guard without touching the broken serial_dispatcher path.
+    """
+    try:
+        lm = getattr(
+            getattr(emotion_analyzer, 'drowsiness_detector', None),
+            'face_landmarker', None
+        )
+        if lm is not None:
+            lm._handle = None   # triggers early-return in close()
+            lm._lib    = None   # prevents any further C calls
+    except Exception:
+        pass
+
+atexit.register(_cleanup)
+
+# 1. Setup App
 app = FastAPI()
 
 app.add_middleware(
@@ -76,14 +99,12 @@ async def generate_resume_questions():
         if not api_key:
             return {"status": "error", "questions": [], "message": "Missing API Key"}
         
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         
         # Check if resume was provided
         resume_text = user_context.get("resume_text", "")
         if not resume_text or resume_text.startswith("No resume provided"):
             return {"status": "no_resume", "questions": []}
-        
-        model = genai.GenerativeModel(model_name="gemini-flash-latest")
         
         prompt = f"""
         You are an expert interviewer. Based on the following resume and target role, generate 5 specific interview questions.
@@ -103,7 +124,10 @@ async def generate_resume_questions():
         """
         
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
             text_response = response.text.replace("```json", "").replace("```", "").strip()
             questions = json.loads(text_response)
             
@@ -112,12 +136,13 @@ async def generate_resume_questions():
                 return {"status": "success", "questions": questions[:5]}
             else:
                 return {"status": "error", "questions": [], "message": "Invalid response format"}
-        except ResourceExhausted:
-            print("⚠️ Gemini quota exceeded for question generation")
-            return {"status": "quota_exceeded", "questions": [], "message": "API quota exceeded"}
         except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                print("⚠️ Gemini quota exceeded for question generation")
+                return {"status": "quota_exceeded", "questions": [], "message": "API quota exceeded"}
             print(f"⚠️ Question generation failed: {e}")
-            return {"status": "error", "questions": [], "message": str(e)}
+            return {"status": "error", "questions": [], "message": err}
     
     except Exception as e:
         print(f"❌ Error generating questions: {e}")
@@ -139,20 +164,18 @@ async def process_video(file: UploadFile = File(...), question: str = Form("Tell
         if not api_key:
             return {"error": "Missing API Key"}
 
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         
         # Define async helper functions for parallel processing
         async def run_gemini_analysis():
             """Upload video to Gemini and get AI analysis"""
-            model = genai.GenerativeModel(model_name="gemini-flash-latest")
-            
             print("☁️ Uploading video to Gemini...")
-            video_file = genai.upload_file(temp_filename)
+            video_file = client.files.upload(file=temp_filename)
             
             # Wait for processing
             while video_file.state.name == "PROCESSING":
                 await asyncio.sleep(1)
-                video_file = genai.get_file(video_file.name)
+                video_file = client.files.get(name=video_file.name)
 
             if video_file.state.name == "FAILED":
                 raise ValueError("Video processing failed on Google's side.")
@@ -179,14 +202,21 @@ async def process_video(file: UploadFile = File(...), question: str = Form("Tell
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    response = model.generate_content([video_file, prompt])
-                    break 
-                except ResourceExhausted:
-                    if attempt < max_retries - 1:
-                        print(f"⚠️ Quota hit. Waiting 5 seconds... (Attempt {attempt+1})")
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[video_file, prompt]
+                    )
+                    break
+                except Exception as ex:
+                    err_str = str(ex)
+                    is_retryable = any(k in err_str.lower() for k in ["429", "quota", "resource_exhausted", "503", "unavailable"])
+                    if is_retryable and attempt < max_retries - 1:
+                        print(f"⚠️ API High Demand/Quota. Waiting 5 seconds... (Attempt {attempt+1})")
                         await asyncio.sleep(5)
+                    elif attempt == max_retries - 1 and is_retryable:
+                        raise Exception("API is currently experiencing high demand or quota limits. Please try again.")
                     else:
-                        raise Exception("Daily Quota Exceeded. Please try again tomorrow.")
+                        raise
 
             # Clean Response
             text_response = response.text.replace("```json", "").replace("```", "").strip()
@@ -229,8 +259,9 @@ async def process_video(file: UploadFile = File(...), question: str = Form("Tell
         return final_response
 
     except Exception as e:
-        print(f"❌ ERROR: {e}")
-        return {"status": "error", "message": str(e)}
+        err_msg = str(e)
+        print(f"❌ ERROR: {err_msg}")
+        return {"status": "error", "message": err_msg}
 
 # --- ROUTE 3: GENERATE BOOTCAMP PLAN ---
 @app.post("/generate_bootcamp_plan")
@@ -247,8 +278,7 @@ async def generate_bootcamp_plan(
         if not api_key:
             return {"status": "error", "message": "Missing API Key"}
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name="gemini-flash-latest")
+        client = genai.Client(api_key=api_key)
 
         resume_context = f"\nCandidate Resume:\n{resume_text[:1500]}" if resume_text else ""
 
@@ -295,16 +325,20 @@ CRITICAL: Return ONLY valid JSON in this exact structure, no markdown:
 }}
 """
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
             text = response.text.replace("```json", "").replace("```", "").strip()
             plan_data = json.loads(text)
             print(f"✅ Bootcamp plan generated for {actual_days} days")
             return {"status": "success", "plan": plan_data}
-        except ResourceExhausted:
-            return {"status": "error", "message": "API quota exceeded. Try again later."}
         except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                return {"status": "error", "message": "API quota exceeded. Try again later."}
             print(f"⚠️ Plan generation error: {e}")
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": err}
 
     except Exception as e:
         print(f"❌ Bootcamp plan error: {e}")
@@ -331,16 +365,15 @@ async def process_bootcamp_answer(
         if not api_key:
             return {"error": "Missing API Key"}
 
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
 
         async def run_gemini_bootcamp():
-            model = genai.GenerativeModel(model_name="gemini-flash-latest")
             print("☁️ Uploading bootcamp video to Gemini...")
-            video_file = genai.upload_file(temp_filename)
+            video_file = client.files.upload(file=temp_filename)
 
             while video_file.state.name == "PROCESSING":
                 await asyncio.sleep(1)
-                video_file = genai.get_file(video_file.name)
+                video_file = client.files.get(name=video_file.name)
 
             if video_file.state.name == "FAILED":
                 raise ValueError("Video processing failed.")
@@ -361,13 +394,20 @@ Analyze the video response. Return ONLY valid JSON, no markdown:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    response = model.generate_content([video_file, prompt])
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[video_file, prompt]
+                    )
                     break
-                except ResourceExhausted:
-                    if attempt < max_retries - 1:
+                except Exception as ex:
+                    err_str = str(ex)
+                    is_retryable = any(k in err_str.lower() for k in ["429", "quota", "resource_exhausted", "503", "unavailable"])
+                    if is_retryable and attempt < max_retries - 1:
                         await asyncio.sleep(5)
+                    elif attempt == max_retries - 1 and is_retryable:
+                        raise Exception("API is currently experiencing high demand or quota limits. Please try again.")
                     else:
-                        raise Exception("Quota exceeded. Try again tomorrow.")
+                        raise
 
             text = response.text.replace("```json", "").replace("```", "").strip()
             return json.loads(text)

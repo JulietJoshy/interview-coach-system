@@ -27,12 +27,31 @@ const BootcampSetup = ({ onPlanGenerated, onBack }) => {
 
         try {
             let resumeText = "";
+            let generatedResumeQs = [];
+
             if (file) {
-                // We'll send the resume to the backend for parsing if needed.
-                // For now we just note the filename as context.
                 resumeText = `Resume uploaded: ${file.name}`;
+
+                // 1. Upload resume to set context for questions
+                try {
+                    const ctxFormData = new FormData();
+                    ctxFormData.append("job_role", jobRole);
+                    ctxFormData.append("file", file);
+                    await axios.post("http://127.0.0.1:8000/upload_resume", ctxFormData, {
+                        headers: { "Content-Type": "multipart/form-data" },
+                    });
+
+                    // 2. Generate resume questions
+                    const qRes = await axios.post("http://127.0.0.1:8000/generate_resume_questions");
+                    if (qRes.data.status === "success" && qRes.data.questions?.length > 0) {
+                        generatedResumeQs = qRes.data.questions;
+                    }
+                } catch (err) {
+                    console.warn("Could not generate resume questions:", err);
+                }
             }
 
+            // 3. Generate the bootcamp plan
             const formData = new FormData();
             formData.append("job_role", jobRole);
             formData.append("days", days);
@@ -45,7 +64,7 @@ const BootcampSetup = ({ onPlanGenerated, onBack }) => {
             );
 
             if (response.data.status === "success") {
-                onPlanGenerated(response.data.plan, jobRole);
+                onPlanGenerated(response.data.plan, jobRole, generatedResumeQs);
             } else {
                 setError(`❌ ${response.data.message || "Failed to generate plan."}`);
             }

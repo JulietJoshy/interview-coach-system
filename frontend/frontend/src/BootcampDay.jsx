@@ -11,15 +11,17 @@ const VideoPreview = ({ stream }) => {
     return <video ref={videoRef} autoPlay muted />;
 };
 
-const BootcampDay = ({ dayItem, jobRole, onDayComplete, onBack }) => {
+const BootcampDay = ({ dayItem, jobRole, resumeQuestions = [], onDayComplete, onBack }) => {
     const [currentQIndex, setCurrentQIndex] = useState(0);
+    const [activeResumeQuestion, setActiveResumeQuestion] = useState(null); // Track if a resume question is selected
     const [analysis, setAnalysis] = useState(null);
     const [loading, setLoading] = useState(false);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [answeredCount, setAnsweredCount] = useState(0);
 
     const questions = dayItem.questions;
-    const currentQuestion = questions[currentQIndex];
+    // Current question is either the selected resume question, or the bootcamp day question
+    const currentQuestion = activeResumeQuestion || questions[currentQIndex];
 
     const handleOnStop = async (blobUrl, blob) => {
         setLoading(true);
@@ -67,6 +69,10 @@ const BootcampDay = ({ dayItem, jobRole, onDayComplete, onBack }) => {
 
     const speakText = (text) => {
         window.speechSynthesis.cancel();
+        if (isSpeaking) {
+            setIsSpeaking(false);
+            return;
+        }
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.onend = () => setIsSpeaking(false);
         window.speechSynthesis.speak(utterance);
@@ -75,7 +81,11 @@ const BootcampDay = ({ dayItem, jobRole, onDayComplete, onBack }) => {
 
     const goNextQuestion = () => {
         setAnalysis(null);
-        setCurrentQIndex((prev) => prev + 1);
+        setActiveResumeQuestion(null); // Clear resume question if active
+        // Only increment index if we aren't at the end of bootcamp questions
+        if (currentQIndex < questions.length - 1) {
+            setCurrentQIndex((prev) => prev + 1);
+        }
         window.speechSynthesis.cancel();
     };
 
@@ -113,7 +123,7 @@ const BootcampDay = ({ dayItem, jobRole, onDayComplete, onBack }) => {
                 {/* LEFT: Video + controls */}
                 <div className="left-panel">
                     <div className="current-question-display">
-                        <small>Question {currentQIndex + 1} of {questions.length}</small>
+                        <small>{activeResumeQuestion ? "Resume-Based Topic" : `Question ${currentQIndex + 1} of ${questions.length}`}</small>
                         <h2>"{currentQuestion}"</h2>
                     </div>
 
@@ -176,9 +186,9 @@ const BootcampDay = ({ dayItem, jobRole, onDayComplete, onBack }) => {
 
                             {/* Navigation */}
                             <div className="day-nav-actions">
-                                {currentQIndex < questions.length - 1 ? (
+                                {currentQIndex < questions.length - 1 || activeResumeQuestion ? (
                                     <button className="begin-btn" onClick={goNextQuestion}>
-                                        Next Question →
+                                        {activeResumeQuestion ? "Return to Bootcamp Questions →" : "Next Question →"}
                                     </button>
                                 ) : (
                                     <button
@@ -200,15 +210,36 @@ const BootcampDay = ({ dayItem, jobRole, onDayComplete, onBack }) => {
                         {questions.map((q, i) => (
                             <div
                                 key={i}
-                                className={`question-item ${i === currentQIndex ? "active" : ""} ${i < currentQIndex ? "question-answered" : ""}`}
+                                className={`question-item ${i === currentQIndex && !activeResumeQuestion ? "active" : ""} ${i < currentQIndex ? "question-answered" : ""}`}
+                                onClick={() => { setActiveResumeQuestion(null); setCurrentQIndex(i); setAnalysis(null); window.speechSynthesis.cancel(); }}
+                                style={{ cursor: "pointer" }}
                             >
                                 <h4>
-                                    {i < currentQIndex ? "✅" : i === currentQIndex ? "▶" : `${i + 1}.`}{" "}
+                                    {i < currentQIndex ? "✅" : i === currentQIndex && !activeResumeQuestion ? "▶" : `${i + 1}.`}{" "}
                                     {q}
                                 </h4>
                             </div>
                         ))}
                     </div>
+
+                    {resumeQuestions.length > 0 && (
+                        <div className="resume-questions-section" style={{ marginTop: "24px" }}>
+                            <h3>📄 Resume-Based Questions</h3>
+                            <p className="resume-q-hint">Optional: Tailored to your resume</p>
+                            <div className="questions-list">
+                                {resumeQuestions.map((q, i) => (
+                                    <div
+                                        key={`resume-${i}`}
+                                        className={`question-item resume-q ${activeResumeQuestion === q ? 'active' : ''}`}
+                                        onClick={() => { setActiveResumeQuestion(q); setAnalysis(null); window.speechSynthesis.cancel(); }}
+                                        style={{ cursor: "pointer", borderLeft: activeResumeQuestion === q ? "3px solid #60a5fa" : "3px solid transparent" }}
+                                    >
+                                        <h4>{i + 1}. {q}</h4>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
 
                     <div className="day-tip-box">
                         <h4>💡 Day {dayItem.day} Tip</h4>

@@ -1,254 +1,264 @@
 import cv2
 import numpy as np
-import mediapipe as mp
+import os
 from collections import deque
 
+# ─── API availability ─────────────────────────────────────────────────────────
+_FACE_MESH_AVAILABLE = False
+_TASKS_AVAILABLE     = False
+_mp_module = None
+
+try:
+    import mediapipe as mp
+    _mp_module = mp
+
+    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
+        _FACE_MESH_AVAILABLE = True
+        print("✅ EyeTracker: mp.solutions.face_mesh available")
+
+    try:
+        from mediapipe.tasks import python as mp_tasks
+        from mediapipe.tasks.python import vision as mp_vision
+        from mediapipe.tasks.python.vision import FaceLandmarkerOptions
+        _TASKS_AVAILABLE = True
+    except Exception:
+        pass
+
+except Exception as e:
+    print(f"⚠️ EyeTracker: MediaPipe not available: {e}")
+
+
 class EyeTracker:
+    """
+    Eye-contact tracker for interview coaching.
+
+    PRIMARY signal  — nose centering between eye corners:
+        When you face the camera your nose sits ~0.5 of the way between
+        the outer eye corners.  Head turns shift the nose clearly off-centre.
+        This gives a strong, reliable look-away signal that iris-ratio cannot.
+
+    SECONDARY signal — iris-within-eye ratio (catches eye-only gaze shifts).
+
+    Both signals are checked; either one failing means "looking away".
+    """
+
+    # ── Landmark indices (works for both FaceMesh and FaceLandmarker) ─────────
+    LEFT_IRIS   = [469, 470, 471, 472]
+    RIGHT_IRIS  = [474, 475, 476, 477]
+    LEFT_EYE    = [33,  133, 160, 159, 158, 144, 145, 153]  # [0]=outer, [1]=inner
+    RIGHT_EYE   = [263, 362, 387, 386, 385, 373, 374, 380]  # [0]=outer, [1]=inner
+    NOSE_TIP    = 4    # actual nose tip (more forward than landmark 1)
+    L_EYE_OUT   = 33   # left  eye outer corner (temple side)
+    R_EYE_OUT   = 263  # right eye outer corner (temple side)
+
+    # ── Thresholds ────────────────────────────────────────────────────────────
+    # Nose centering: 0 = at left eye corner, 1 = at right eye corner
+    # When facing camera nose is ~0.5; outside 0.35–0.65 → head turned
+    NOSE_CENTER_MIN = 0.35
+    NOSE_CENTER_MAX = 0.65
+    # Iris ratio: 0.35–0.65 = looking at camera
+    IRIS_RATIO_MIN  = 0.30
+    IRIS_RATIO_MAX  = 0.70
+
     def __init__(self):
-        """Initialize MediaPipe Face Mesh for eye tracking"""
-        # Use the correct MediaPipe API
-        mp_face_mesh = mp.solutions.face_mesh if hasattr(mp, 'solutions') else None
+        self.face_mesh       = None
+        self.face_landmarker = None
+        self.use_face_mesh   = False
+        self.use_tasks       = False
 
-        if mp_face_mesh is None:
-            # Fallback: Use simple eye tracker instead
-            print("⚠️ MediaPipe solutions not available. Using simplified eye tracking.")
-            from .simple_eye_tracker import SimpleEyeTracker
-            self.simple_tracker = SimpleEyeTracker()
-            self.face_mesh = None
-            self.use_mediapipe = False
-        else:
-            self.simple_tracker = None
-            self.face_mesh = mp_face_mesh.FaceMesh(
-                max_num_faces=1,
-                refine_landmarks=True,  # Enable iris landmarks
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
-            )
-            self.use_mediapipe = True
-
-        # Iris landmarks indices (MediaPipe provides 468 face landmarks + 10 iris landmarks)
-        self.LEFT_IRIS = [469, 470, 471, 472]
-        self.RIGHT_IRIS = [474, 475, 476, 477]
-
-        # Eye landmarks for calculating eye center
-        self.LEFT_EYE = [33, 133, 160, 159, 158, 144, 145, 153]
-        self.RIGHT_EYE = [362, 263, 387, 386, 385, 373, 374, 380]
-
-        # 6 key landmarks for head pose estimation (nose tip, chin, left/right eye corners, left/right mouth corners)
-        self.HEAD_POSE_LANDMARKS = [1, 152, 33, 263, 61, 291]
-
-        # Store gaze history for smoothing
         self.gaze_history = deque(maxlen=30)
+        self._gaze_window = deque(maxlen=3)
 
-        # Temporal smoothing window for majority vote
-        self._gaze_window = deque(maxlen=5)
+        # ── Classic FaceMesh (preferred — reference approach) ─────────────────
+        if _FACE_MESH_AVAILABLE:
+            try:
+                self.face_mesh = _mp_module.solutions.face_mesh.FaceMesh(
+                    max_num_faces=1,
+                    refine_landmarks=True,   # enables iris landmarks 469-477
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                self.use_face_mesh = True
+                print("✅ EyeTracker: FaceMesh initialised")
+            except Exception as e:
+                print(f"⚠️ EyeTracker: FaceMesh init failed: {e}")
+
+        # ── Tasks API fallback ────────────────────────────────────────────────
+        # NOTE: Skipped intentionally. In the main pipeline, EyeTracker always
+        # receives landmarks shared from DrowsinessDetector (which has its own
+        # FaceLandmarker). Creating a second FaceLandmarker here causes a
+        # mediapipe C-library conflict and crashes the backend on startup.
+        # The Tasks API path in _detect_tasks() is only used by the standalone
+        # analyze_video() fallback, which is rarely triggered.
+        # To re-enable: set self.use_tasks = True and init self.face_landmarker.
+        self.use_tasks = False
+        self.face_landmarker = None
+
+        if not self.use_face_mesh and not self.use_tasks:
+            print("⚠️ EyeTracker: no MediaPipe API available (FaceMesh will be used if available)")
+
+    @property
+    def use_mediapipe(self):
+        return self.use_face_mesh or self.use_tasks
 
     def reset(self):
-        """Clear smoothing/gaze history between videos"""
         self.gaze_history.clear()
         self._gaze_window.clear()
 
-    def calculate_gaze_ratio(self, eye_points, iris_center, frame_width):
-        """Calculate where the iris is positioned relative to eye corners"""
-        left_point = eye_points[0]
-        right_point = eye_points[4]
+    # =========================================================================
+    # Geometry helpers
+    # =========================================================================
 
-        # Calculate eye width
-        eye_width = np.linalg.norm(np.array(right_point) - np.array(left_point))
-
-        # Calculate iris position relative to left corner
-        iris_distance_from_left = np.linalg.norm(np.array(iris_center) - np.array(left_point))
-
-        # Ratio: 0.5 = center, <0.3 = looking left, >0.7 = looking right
-        if eye_width > 0:
-            return iris_distance_from_left / eye_width
-        return 0.5
+    def _lm_px(self, lm, w, h):
+        """Landmark → pixel coords."""
+        return lm.x * w, lm.y * h
 
     def get_iris_position(self, landmarks, iris_indices, frame_shape):
-        """Get the center position of the iris"""
         h, w = frame_shape[:2]
-
-        iris_points = []
-        for idx in iris_indices:
-            if idx < len(landmarks):
-                lm = landmarks[idx]
-                x = int(lm.x * w)
-                y = int(lm.y * h)
-                iris_points.append([x, y])
-
-        if len(iris_points) > 0:
-            # Calculate center of iris
-            iris_center = np.mean(iris_points, axis=0)
-            return iris_center
-        return None
+        pts = [[landmarks[i].x * w, landmarks[i].y * h]
+               for i in iris_indices if i < len(landmarks)]
+        return np.mean(pts, axis=0) if pts else None
 
     def get_eye_points(self, landmarks, eye_indices, frame_shape):
-        """Get eye corner points"""
         h, w = frame_shape[:2]
+        return [[landmarks[i].x * w, landmarks[i].y * h] for i in eye_indices]
 
-        eye_points = []
-        for idx in eye_indices:
-            lm = landmarks[idx]
-            x = int(lm.x * w)
-            y = int(lm.y * h)
-            eye_points.append([x, y])
-
-        return eye_points
-
-    def _smoothed_gaze(self, raw_gaze):
-        """Apply sliding-window majority vote for temporal smoothing"""
-        self._gaze_window.append(raw_gaze)
-        if len(self._gaze_window) < 3:
-            return raw_gaze
-        # Majority vote
-        counts = {}
-        for g in self._gaze_window:
-            counts[g] = counts.get(g, 0) + 1
-        return max(counts, key=counts.get)
-
-    def estimate_head_pose(self, landmarks, frame_shape):
+    def calculate_iris_ratio(self, eye_points, iris_center):
         """
-        Estimate head yaw angle using 6 MediaPipe landmarks and cv2.solvePnP.
-        Returns yaw angle in degrees, or None if estimation fails.
+        Iris position as fraction of horizontal eye width.
+        Uses index [0] (outer corner) and [1] (inner corner) — the true edges.
+        Returns ~0.5 when iris is centred.
+        """
+        p0 = np.array(eye_points[0], float)
+        p1 = np.array(eye_points[1], float)
+        lp, rp = (p0, p1) if p0[0] < p1[0] else (p1, p0)   # left → right
+        width = np.linalg.norm(rp - lp)
+        if width == 0:
+            return 0.5
+        return float(np.linalg.norm(np.array(iris_center, float) - lp) / width)
+
+    # =========================================================================
+    # PRIMARY SIGNAL: nose centering
+    # =========================================================================
+
+    def get_nose_centering(self, landmarks, frame_shape):
+        """
+        Returns the nose-tip x-position normalised by the span between the two
+        outer eye corners (0 = at left-screen corner, 1 = at right-screen corner).
+
+        Expected value when facing camera: ~0.45–0.55
+        Head turned to person's RIGHT  (nose shifts left on screen): value < 0.35
+        Head turned to person's LEFT   (nose shifts right on screen): value > 0.65
         """
         h, w = frame_shape[:2]
-
-        # 3D model points (generic face model)
-        model_points = np.array([
-            (0.0, 0.0, 0.0),          # Nose tip
-            (0.0, -330.0, -65.0),      # Chin
-            (-225.0, 170.0, -135.0),   # Left eye left corner
-            (225.0, 170.0, -135.0),    # Right eye right corner
-            (-150.0, -150.0, -125.0),  # Left mouth corner
-            (150.0, -150.0, -125.0)    # Right mouth corner
-        ], dtype=np.float64)
-
-        # 2D image points from landmarks
-        image_points = []
-        for idx in self.HEAD_POSE_LANDMARKS:
-            if idx < len(landmarks):
-                lm = landmarks[idx]
-                image_points.append([lm.x * w, lm.y * h])
-            else:
+        try:
+            nose_x = landmarks[self.NOSE_TIP].x * w
+            l_x    = landmarks[self.L_EYE_OUT].x * w
+            r_x    = landmarks[self.R_EYE_OUT].x * w
+            left_x, right_x = min(l_x, r_x), max(l_x, r_x)
+            span = right_x - left_x
+            if span < 10:
                 return None
-
-        image_points = np.array(image_points, dtype=np.float64)
-
-        # Camera internals (approximate)
-        focal_length = w
-        center = (w / 2, h / 2)
-        camera_matrix = np.array([
-            [focal_length, 0, center[0]],
-            [0, focal_length, center[1]],
-            [0, 0, 1]
-        ], dtype=np.float64)
-
-        dist_coeffs = np.zeros((4, 1))
-
-        success, rotation_vector, translation_vector = cv2.solvePnP(
-            model_points, image_points, camera_matrix, dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-
-        if not success:
+            return (nose_x - left_x) / span
+        except (IndexError, AttributeError):
             return None
 
-        # Convert rotation vector to rotation matrix, then extract yaw
-        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-        # Decompose to get Euler angles
-        proj_matrix = np.hstack((rotation_matrix, translation_vector))
-        _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(
-            np.vstack((proj_matrix, [0, 0, 0, 1]))[:3]
-        )
-        yaw = euler_angles[1, 0]
-        return abs(yaw)
+    # =========================================================================
+    # Combined classifier
+    # =========================================================================
 
-    def is_looking_at_camera(self, gaze_direction, yaw_angle):
+    def _is_looking(self, landmarks, frame_shape):
         """
-        Combined detection: iris gaze centered AND head yaw < 15 degrees.
-        Returns True if the person is looking at the camera.
+        True = looking at camera.
+        Uses nose centering (primary) + iris ratio (secondary).
         """
-        gaze_ok = gaze_direction == "center"
-        if yaw_angle is not None:
-            head_ok = yaw_angle < 15.0
-            return gaze_ok and head_ok
-        # If head pose estimation failed, rely on gaze alone
-        return gaze_ok
+        h, w = frame_shape[:2]
 
-    def classify_gaze(self, left_ratio, right_ratio):
-        """Classify gaze direction based on iris ratios (tighter thresholds)"""
-        avg_ratio = (left_ratio + right_ratio) / 2
+        # ── SIGNAL 1: nose centering (head-turn detector) ─────────────────────
+        nose_pos = self.get_nose_centering(landmarks, frame_shape)
+        if nose_pos is not None:
+            if nose_pos < self.NOSE_CENTER_MIN or nose_pos > self.NOSE_CENTER_MAX:
+                return False   # head clearly turned away
 
-        # Looking at camera (centered) — tighter range for accuracy
-        if 0.40 < avg_ratio < 0.60:
-            return "center"
-        # Looking left
-        elif avg_ratio <= 0.40:
-            return "left"
-        # Looking right
-        elif avg_ratio >= 0.60:
-            return "right"
+        # ── SIGNAL 2: iris ratio (eye-only gaze shifts) ───────────────────────
+        if len(landmarks) >= 477:   # iris landmarks available
+            l_iris = self.get_iris_position(landmarks, self.LEFT_IRIS,  frame_shape)
+            r_iris = self.get_iris_position(landmarks, self.RIGHT_IRIS, frame_shape)
+            if l_iris is not None and r_iris is not None:
+                lp = self.get_eye_points(landmarks, self.LEFT_EYE,  frame_shape)
+                rp = self.get_eye_points(landmarks, self.RIGHT_EYE, frame_shape)
+                l_ratio = self.calculate_iris_ratio(lp, l_iris)
+                r_ratio = self.calculate_iris_ratio(rp, r_iris)
+                avg = (l_ratio + r_ratio) / 2.0
+                if avg < self.IRIS_RATIO_MIN or avg > self.IRIS_RATIO_MAX:
+                    return False   # eyes drifted off-centre
 
-        return "center"
+        return True
+
+    def _smooth(self, raw: bool) -> bool:
+        """Majority vote over last 3 frames to dampen single-frame noise."""
+        self._gaze_window.append(raw)
+        if len(self._gaze_window) < 2:
+            return raw
+        trues  = sum(1 for v in self._gaze_window if v)
+        falses = len(self._gaze_window) - trues
+        return trues >= falses
+
+    def _make_result(self, landmarks, frame_shape):
+        """Run signals, smooth, and return result dict."""
+        looking_raw    = self._is_looking(landmarks, frame_shape)
+        looking        = self._smooth(looking_raw)
+        gaze_direction = "center" if looking else "away"
+        self.gaze_history.append(gaze_direction)
+        return {"gaze": gaze_direction, "looking_at_camera": looking}
+
+    # =========================================================================
+    # Public API used by inference.py (shared landmarks from DrowsinessDetector)
+    # =========================================================================
+
+    def analyze_gaze_from_landmarks(self, landmarks, frame_shape):
+        """Called by single-pass pipeline with pre-detected landmarks."""
+        if landmarks is None or len(landmarks) < 6:
+            return None
+        return self._make_result(landmarks, frame_shape)
+
+    # =========================================================================
+    # Public API — standalone per-frame (used in analyze_video below)
+    # =========================================================================
 
     def process_frame(self, rgb_frame, frame_shape):
-        """
-        Single-frame API for use in the unified inference pipeline.
-        Returns dict with gaze, looking_at_camera, landmarks or None if no face detected.
-        """
-        if not self.use_mediapipe or self.face_mesh is None:
+        lms = self._detect_classic(rgb_frame) or self._detect_tasks(rgb_frame)
+        return self._make_result(lms, frame_shape) if lms else None
+
+    def _detect_classic(self, rgb_frame):
+        if not self.use_face_mesh or self.face_mesh is None:
             return None
+        try:
+            r = self.face_mesh.process(rgb_frame)
+            if r.multi_face_landmarks:
+                return r.multi_face_landmarks[0].landmark
+        except Exception:
+            pass
+        return None
 
-        results = self.face_mesh.process(rgb_frame)
-
-        if not results.multi_face_landmarks:
+    def _detect_tasks(self, rgb_frame):
+        if not self.use_tasks or self.face_landmarker is None or _mp_module is None:
             return None
+        try:
+            img = _mp_module.Image(image_format=_mp_module.ImageFormat.SRGB, data=rgb_frame)
+            r   = self.face_landmarker.detect(img)
+            if r.face_landmarks:
+                return r.face_landmarks[0]
+        except Exception:
+            pass
+        return None
 
-        landmarks = results.multi_face_landmarks[0].landmark
-
-        # Get iris positions
-        left_iris_center = self.get_iris_position(landmarks, self.LEFT_IRIS, frame_shape)
-        right_iris_center = self.get_iris_position(landmarks, self.RIGHT_IRIS, frame_shape)
-
-        if left_iris_center is None or right_iris_center is None:
-            return None
-
-        # Get eye points
-        left_eye_points = self.get_eye_points(landmarks, self.LEFT_EYE, frame_shape)
-        right_eye_points = self.get_eye_points(landmarks, self.RIGHT_EYE, frame_shape)
-
-        # Calculate gaze ratios
-        left_ratio = self.calculate_gaze_ratio(left_eye_points, left_iris_center, frame_shape[1])
-        right_ratio = self.calculate_gaze_ratio(right_eye_points, right_iris_center, frame_shape[1])
-
-        # Classify gaze with temporal smoothing
-        raw_gaze = self.classify_gaze(left_ratio, right_ratio)
-        gaze_direction = self._smoothed_gaze(raw_gaze)
-        self.gaze_history.append(gaze_direction)
-
-        # Head pose estimation
-        yaw_angle = self.estimate_head_pose(landmarks, frame_shape)
-
-        # Combined detection
-        looking = self.is_looking_at_camera(gaze_direction, yaw_angle)
-
-        return {
-            "gaze": gaze_direction,
-            "looking_at_camera": looking,
-            "landmarks": landmarks
-        }
+    # =========================================================================
+    # Standalone video analysis
+    # =========================================================================
 
     def analyze_video(self, video_path):
-        """
-        Analyze eye movements in a video.
-        Returns eye contact metrics and coaching feedback.
-        """
-        # Check if MediaPipe is available, use simple tracker as fallback
-        if not self.use_mediapipe and self.simple_tracker is not None:
-            print("⚠️ Using simplified eye tracking (MediaPipe not available)")
-            return self.simple_tracker.analyze_video(video_path)
-        elif not self.use_mediapipe:
-            print("⚠️ Eye tracking unavailable - no tracker initialized")
+        if not self.use_mediapipe:
             return {
                 "error": "Eye tracking not available",
                 "eye_contact_percentage": 0,
@@ -258,139 +268,78 @@ class EyeTracker:
             }
 
         cap = cv2.VideoCapture(video_path)
-
-        total_frames = 0
-        frames_with_face = 0
-        center_gaze_frames = 0
-        looking_away_events = []
-
-        current_gaze = "center"
-        consecutive_away_frames = 0
-
-        frame_count = 0
-        skip_frames = 3  # Analyze every 3rd frame for efficiency
-
-        print(f"👁️ Starting eye tracking analysis for: {video_path}")
+        frames_with_face = center_frames = consecutive_away = frame_count = 0
+        away_events = []
+        skip = 3
+        print(f"👁️ Eye tracking: {video_path}")
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-
             frame_count += 1
-            if frame_count % skip_frames != 0:
+            if frame_count % skip != 0:
                 continue
-
-            total_frames += 1
-
-            # Convert BGR to RGB for MediaPipe
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(rgb_frame)
-
-            if results.multi_face_landmarks:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.process_frame(rgb, frame.shape)
+            if res:
                 frames_with_face += 1
-                landmarks = results.multi_face_landmarks[0].landmark
-
-                # Get iris positions
-                left_iris_center = self.get_iris_position(landmarks, self.LEFT_IRIS, frame.shape)
-                right_iris_center = self.get_iris_position(landmarks, self.RIGHT_IRIS, frame.shape)
-
-                if left_iris_center is not None and right_iris_center is not None:
-                    # Get eye points
-                    left_eye_points = self.get_eye_points(landmarks, self.LEFT_EYE, frame.shape)
-                    right_eye_points = self.get_eye_points(landmarks, self.RIGHT_EYE, frame.shape)
-
-                    # Calculate gaze ratios
-                    left_ratio = self.calculate_gaze_ratio(left_eye_points, left_iris_center, frame.shape[1])
-                    right_ratio = self.calculate_gaze_ratio(right_eye_points, right_iris_center, frame.shape[1])
-
-                    # Classify gaze
-                    gaze_direction = self.classify_gaze(left_ratio, right_ratio)
-                    self.gaze_history.append(gaze_direction)
-
-                    if gaze_direction == "center":
-                        center_gaze_frames += 1
-                        consecutive_away_frames = 0
-                    else:
-                        consecutive_away_frames += 1
-
-                        # Detect "looking away" event (looked away for 5+ consecutive frames)
-                        if consecutive_away_frames == 5:
-                            looking_away_events.append(frame_count)
-                            current_gaze = gaze_direction
-
-            if total_frames % 50 == 0:
-                print(f"   ...Processed {total_frames} frames for eye tracking...")
+                if res["looking_at_camera"]:
+                    center_frames  += 1
+                    consecutive_away = 0
+                else:
+                    consecutive_away += 1
+                    if consecutive_away == 5:
+                        away_events.append(frame_count)
 
         cap.release()
-        print(f"✅ Eye tracking complete. Analyzed {frames_with_face} frames with detected faces.")
-
         if frames_with_face == 0:
             return {
-                "error": "No faces detected for eye tracking",
+                "error": "No faces detected",
                 "eye_contact_percentage": 0,
                 "looking_away_count": 0,
                 "gaze_stability": "Unknown",
-                "coaching_feedback": ["Could not detect eyes in the video. Ensure your face is clearly visible."]
+                "coaching_feedback": ["Could not detect face. Ensure good lighting."]
             }
 
-        # Calculate metrics
-        eye_contact_percentage = round((center_gaze_frames / frames_with_face) * 100, 1)
-        looking_away_count = len(looking_away_events)
-
-        # Determine gaze stability
-        if eye_contact_percentage >= 70:
-            gaze_stability = "Excellent"
-        elif eye_contact_percentage >= 50:
-            gaze_stability = "Good"
-        elif eye_contact_percentage >= 30:
-            gaze_stability = "Fair"
-        else:
-            gaze_stability = "Needs Improvement"
-
-        # Generate coaching feedback
-        feedback = self.generate_coaching_feedback(
-            eye_contact_percentage,
-            looking_away_count,
-            gaze_stability
-        )
-
+        pct   = round(center_frames / frames_with_face * 100, 1)
+        count = len(away_events)
+        stab  = ("Excellent" if pct >= 70 else "Good" if pct >= 50
+                 else "Fair" if pct >= 30 else "Needs Improvement")
         return {
-            "eye_contact_percentage": eye_contact_percentage,
-            "looking_away_count": looking_away_count,
-            "gaze_stability": gaze_stability,
-            "coaching_feedback": feedback
+            "eye_contact_percentage": pct,
+            "looking_away_count":     count,
+            "gaze_stability":         stab,
+            "coaching_feedback":      self.generate_coaching_feedback(pct, count, stab)
         }
 
-    def generate_coaching_feedback(self, eye_contact_pct, looking_away_count, stability):
-        """Generate personalized coaching tips based on eye tracking metrics"""
-        feedback = []
-
-        # Feedback based on eye contact percentage
-        if eye_contact_pct >= 70:
-            feedback.append(f"Excellent eye contact! You maintained {eye_contact_pct}% eye contact.")
-        elif eye_contact_pct >= 50:
-            feedback.append(f"Good eye contact at {eye_contact_pct}%. Try to increase it to 70%+ for stronger engagement.")
-        elif eye_contact_pct >= 30:
-            feedback.append(f"Eye contact was {eye_contact_pct}%. Practice maintaining eye contact for longer periods.")
+    def generate_coaching_feedback(self, pct, away_count, stability):
+        fb = []
+        if pct >= 70:
+            fb.append(f"Excellent eye contact! You maintained {pct}% eye contact.")
+        elif pct >= 50:
+            fb.append(f"Good eye contact at {pct}%. Aim for 70%+ for stronger engagement.")
+        elif pct >= 30:
+            fb.append(f"Eye contact was {pct}%. Practice holding eye contact longer.")
         else:
-            feedback.append(f"Low eye contact detected ({eye_contact_pct}%). Focus on looking at the camera more consistently.")
+            fb.append(f"Low eye contact ({pct}%). Focus on looking at the camera consistently.")
 
-        # Feedback based on looking away events
-        if looking_away_count == 0:
-            feedback.append("Great focus! You didn't look away during the response.")
-        elif looking_away_count <= 2:
-            feedback.append(f"You looked away {looking_away_count} time(s). This is acceptable, but try to minimize it.")
+        if away_count == 0:
+            fb.append("Great focus! You didn't look away during the response.")
+        elif away_count <= 2:
+            fb.append(f"You looked away {away_count} time(s). Try to minimise this.")
         else:
-            feedback.append(f"You looked away {looking_away_count} times. Work on maintaining steady eye contact to appear more confident.")
+            fb.append(f"You looked away {away_count} times. Work on steady eye contact.")
 
-        # General tip
-        if eye_contact_pct < 60:
-            feedback.append("💡 Tip: Imagine you're talking to a friend. Look directly at the camera lens as if making eye contact.")
-
-        return feedback
+        if pct < 60:
+            fb.append("💡 Tip: Look directly at the camera lens as if making eye contact with the interviewer.")
+        return fb
 
     def __del__(self):
-        """Cleanup"""
-        if hasattr(self, 'face_mesh') and self.face_mesh is not None:
-            self.face_mesh.close()
+        for attr in ('face_mesh', 'face_landmarker'):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass

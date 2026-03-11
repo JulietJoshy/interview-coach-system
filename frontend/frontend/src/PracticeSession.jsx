@@ -17,6 +17,7 @@ const PracticeSession = ({ onBack }) => {
     const [eyeTrackingData, setEyeTrackingData] = useState(null);
     const [drowsinessData, setDrowsinessData] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [errorMessage, setErrorMessage] = useState(null);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [resumeQuestions, setResumeQuestions] = useState([]);
     const [loadingResumeQ, setLoadingResumeQ] = useState(false);
@@ -34,22 +35,22 @@ const PracticeSession = ({ onBack }) => {
     const [selectedQuestion, setSelectedQuestion] = useState("Tell me about yourself.");
 
     const handleResumeUpload = async () => {
-        if (!jobRole) { alert("⚠️ Please enter a Target Job Role"); return; }
+        if (!jobRole) { setErrorMessage("⚠️ Please enter a Target Job Role"); return; }
         const formData = new FormData();
         formData.append("job_role", jobRole);
         if (file) formData.append("file", file);
         try {
             setLoading(true);
+            setErrorMessage(null);
             await axios.post("http://127.0.0.1:8000/upload_resume", formData, {
                 headers: { "Content-Type": "multipart/form-data" },
             });
             setLoading(false);
             setSetupDone(true);
-            if (file) { alert("✅ Resume & Role Analyzed! Starting Interview..."); fetchResumeQuestions(); }
-            else { alert(`✅ Role '${jobRole}' Set! Starting Interview...`); }
+            if (file) fetchResumeQuestions();
         } catch (error) {
             setLoading(false);
-            alert(error.message ? `❌ Network Error: ${error.message}` : "❌ Setup failed.");
+            setErrorMessage(error.message ? `❌ Network Error: ${error.message}` : "❌ Setup failed. Is the backend running?");
         }
     };
 
@@ -65,6 +66,7 @@ const PracticeSession = ({ onBack }) => {
 
     const handleOnStop = async (blobUrl, blob) => {
         setLoading(true);
+        setErrorMessage(null);
         setAnalysis(null); setEmotionData(null); setEyeTrackingData(null); setDrowsinessData(null);
         window.speechSynthesis.cancel();
         try {
@@ -75,13 +77,21 @@ const PracticeSession = ({ onBack }) => {
             const response = await axios.post("http://127.0.0.1:8000/process-video", formData,
                 { headers: { "Content-Type": "multipart/form-data" } });
             if (response.data.status === "error" || response.data.error) {
-                alert(`❌ Backend Error: ${response.data.message || response.data.error}`); return;
+                const msg = response.data.message || response.data.error || "Unknown error";
+                const isQuota = msg.toLowerCase().includes("quota") || msg.includes("429");
+                setErrorMessage(isQuota
+                    ? "🔑 Gemini API daily quota exceeded. Get a free new key at aistudio.google.com and update your .env file."
+                    : `❌ Backend Error: ${msg}`);
+                return;
             }
             setAnalysis(response.data.ai_analysis);
             if (response.data.emotion_analysis && !response.data.emotion_analysis.error) setEmotionData(response.data.emotion_analysis);
             if (response.data.eye_tracking && !response.data.eye_tracking.error) setEyeTrackingData(response.data.eye_tracking);
             if (response.data.drowsiness && !response.data.drowsiness.error) setDrowsinessData(response.data.drowsiness);
-        } catch (err) { console.error(err); alert("Error processing video."); }
+        } catch (err) {
+            console.error(err);
+            setErrorMessage("❌ Could not connect to backend. Make sure uvicorn is running on port 8000.");
+        }
         finally { setLoading(false); }
     };
 
@@ -98,6 +108,10 @@ const PracticeSession = ({ onBack }) => {
 
     const speakText = (text) => {
         window.speechSynthesis.cancel();
+        if (isSpeaking) {
+            setIsSpeaking(false);
+            return;
+        }
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.onend = () => setIsSpeaking(false);
         window.speechSynthesis.speak(utterance);
@@ -183,6 +197,26 @@ const PracticeSession = ({ onBack }) => {
                         )}
                     </div>
                     {loading && <div className="loading-text">🧠 AI is analyzing your confidence, tone, and content...</div>}
+
+                    {errorMessage && (
+                        <div className="error-banner" style={{
+                            background: "rgba(220,38,38,0.12)",
+                            border: "1px solid rgba(220,38,38,0.4)",
+                            borderRadius: "10px",
+                            padding: "14px 18px",
+                            margin: "12px 0",
+                            color: "#fca5a5",
+                            fontSize: "0.9rem",
+                            lineHeight: 1.5
+                        }}>
+                            {errorMessage}
+                            {errorMessage.includes("quota") && (
+                                <><br /><a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer"
+                                    style={{ color: "#60a5fa", fontWeight: 600 }}>→ Get a free API key here</a></>
+                            )}
+                        </div>
+                    )}
+
 
                     {analysis && (
                         <div className="results fade-in">

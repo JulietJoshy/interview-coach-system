@@ -212,3 +212,9 @@ __marimo__/
 .mp4
 node_modules/
 frontend/node_modules/
+*.h5
+*.dat
+*.caffemodel
+*.prototxt
+backend/data/
+
