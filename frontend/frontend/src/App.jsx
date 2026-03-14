@@ -58,7 +58,7 @@ const App = () => {
               style={{ padding: "6px 14px", fontSize: "0.82rem" }}
               onClick={goHome}
             >
-              ⌂ Home
+              Home
             </button>
           )}
           <span className="navbar-badge">Interview Coach v1.0</span>

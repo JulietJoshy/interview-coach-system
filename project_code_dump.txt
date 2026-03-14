@@ -1,0 +1,4908 @@
+
+================================================================================
+File: backend\main.py
+================================================================================
+
+import os
+import json
+import asyncio
+import time
+from typing import Optional
+from dotenv import load_dotenv
+
+# Load environment variables FIRST before anything else
+# override=True ensures a changed .env is picked up on uvicorn reload
+load_dotenv(override=True)
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pypdf import PdfReader
+from io import BytesIO
+from google import genai
+from google.genai import types as genai_types
+from emotion_recognition.inference import EmotionAnalyzer
+import atexit
+
+# Initialize Emotion Analyzer
+emotion_analyzer = EmotionAnalyzer()
+
+def _cleanup():
+    """Prevent the mediapipe 0.10.x FaceLandmarker __del__ shutdown crash.
+
+    mediapipe's close() method starts with 'if not self._handle: return'.
+    By setting _handle and _lib to None before Python GC runs, __del__ → close()
+    hits the early-return guard without touching the broken serial_dispatcher path.
+    """
+    try:
+        lm = getattr(
+            getattr(emotion_analyzer, 'drowsiness_detector', None),
+            'face_landmarker', None
+        )
+        if lm is not None:
+            lm._handle = None   # triggers early-return in close()
+            lm._lib    = None   # prevents any further C calls
+    except Exception:
+        pass
+
+atexit.register(_cleanup)
+
+# 1. Setup App
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 3. Memory for Context
+user_context = {
+    "job_role": "Software Engineer", 
+    "resume_text": ""
+}
+
+# --- ROUTE 1: SETUP (Resume is OPTIONAL now) ---
+@app.post("/upload_resume")
+async def upload_resume(job_role: str = Form(...), file: Optional[UploadFile] = File(None)):
+    print(f"📄 Receiving setup for role: {job_role}")
+    
+    try:
+        user_context["job_role"] = job_role
+        
+        if file:
+            # Case A: User uploaded a resume
+            content = await file.read()
+            pdf_reader = PdfReader(BytesIO(content))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+            
+            # Limit text to avoid token limits
+            user_context["resume_text"] = text[:2000]
+            print(f"✅ Resume Parsed for {job_role}")
+        else:
+            # Case B: No resume provided
+            user_context["resume_text"] = "No resume provided. Focus strictly on general competency for the role."
+            print(f"⚠️ No Resume provided. Setting context for {job_role} only.")
+            
+        return {"status": "success", "message": "Context updated"}
+
+    except Exception as e:
+        print(f"❌ Error processing setup: {e}")
+        return {"status": "error", "message": str(e)}
+
+# --- ROUTE 1.5: GENERATE RESUME QUESTIONS ---
+@app.post("/generate_resume_questions")
+async def generate_resume_questions():
+    """Generate interview questions based on uploaded resume and target role."""
+    print(f"📝 Generating resume-based questions for: {user_context['job_role']}")
+    
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"status": "error", "questions": [], "message": "Missing API Key"}
+        
+        client = genai.Client(api_key=api_key)
+        
+        # Check if resume was provided
+        resume_text = user_context.get("resume_text", "")
+        if not resume_text or resume_text.startswith("No resume provided"):
+            return {"status": "no_resume", "questions": []}
+        
+        prompt = f"""
+        You are an expert interviewer. Based on the following resume and target role, generate 5 specific interview questions.
+        
+        Target Role: {user_context['job_role']}
+        Resume: {resume_text}
+        
+        Generate questions that:
+        1. Are specific to the candidate's experience and skills mentioned in the resume
+        2. Test technical knowledge relevant to both the resume and target role
+        3. Explore projects or achievements mentioned in the resume
+        4. Assess fit for the target role based on their background
+        5. Challenge the candidate on potential gaps or transitions
+        
+        CRITICAL: Return ONLY a valid JSON array of exactly 5 question strings. No markdown, no explanation.
+        Example: ["Question 1?", "Question 2?", "Question 3?", "Question 4?", "Question 5?"]
+        """
+        
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+            text_response = response.text.replace("```json", "").replace("```", "").strip()
+            questions = json.loads(text_response)
+            
+            if isinstance(questions, list) and len(questions) > 0:
+                print(f"✅ Generated {len(questions)} resume-based questions")
+                return {"status": "success", "questions": questions[:5]}
+            else:
+                return {"status": "error", "questions": [], "message": "Invalid response format"}
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                print("⚠️ Gemini quota exceeded for question generation")
+                return {"status": "quota_exceeded", "questions": [], "message": "API quota exceeded"}
+            print(f"⚠️ Question generation failed: {e}")
+            return {"status": "error", "questions": [], "message": err}
+    
+    except Exception as e:
+        print(f"❌ Error generating questions: {e}")
+        return {"status": "error", "questions": [], "message": str(e)}
+
+# --- ROUTE 2: VIDEO PROCESSING ---
+@app.post("/process-video")
+async def process_video(file: UploadFile = File(...), question: str = Form("Tell me about yourself")):
+    print(f"🎥 Processing Real AI Analysis for: {question}")
+
+    try:
+        # 1. Save video temporarily
+        temp_filename = "temp_video.webm"
+        with open(temp_filename, "wb") as buffer:
+            buffer.write(await file.read())
+
+        # 2. Configure Gemini
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"error": "Missing API Key"}
+
+        client = genai.Client(api_key=api_key)
+        
+        # Define async helper functions for parallel processing
+        async def run_gemini_analysis():
+            """Upload video to Gemini and get AI analysis"""
+            print("☁️ Uploading video to Gemini...")
+            video_file = client.files.upload(file=temp_filename)
+            
+            # Wait for processing
+            while video_file.state.name == "PROCESSING":
+                await asyncio.sleep(1)
+                video_file = client.files.get(name=video_file.name)
+
+            if video_file.state.name == "FAILED":
+                raise ValueError("Video processing failed on Google's side.")
+
+            # Generate Content with RETRY LOGIC
+            print("🧠 Asking AI...")
+            
+            prompt = f"""
+            You are an Interview Coach. The user is answering: "{question}".
+            Target Role: {user_context['job_role']}
+            Resume Context: {user_context['resume_text']}
+            
+            Analyze the video answer. 
+            CRITICAL: Return ONLY valid JSON. No markdown.
+            Structure:
+            {{
+                "rating": (integer 1-100),
+                "feedback": (string, 2-3 sentences),
+                "improved_answer": (string, how to say it better),
+                "follow_up_question": (string, a relevant next question based on the role)
+            }}
+            """
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[video_file, prompt]
+                    )
+                    break
+                except Exception as ex:
+                    err_str = str(ex)
+                    is_retryable = any(k in err_str.lower() for k in ["429", "quota", "resource_exhausted", "503", "unavailable"])
+                    if is_retryable and attempt < max_retries - 1:
+                        print(f"⚠️ API High Demand/Quota. Waiting 5 seconds... (Attempt {attempt+1})")
+                        await asyncio.sleep(5)
+                    elif attempt == max_retries - 1 and is_retryable:
+                        raise Exception("API is currently experiencing high demand or quota limits. Please try again.")
+                    else:
+                        raise
+
+            # Clean Response
+            text_response = response.text.replace("```json", "").replace("```", "").strip()
+            ai_data = json.loads(text_response)
+            print(f"✅ AI Success! Rating: {ai_data.get('rating')}")
+            return ai_data
+        
+        async def run_emotion_analysis():
+            """Analyze facial emotions and eye movements in the video"""
+            print("😊 Analyzing Emotions and Eye Tracking...")
+            # Run in thread pool since emotion_analyzer is sync
+            loop = asyncio.get_event_loop()
+            combined_results = await loop.run_in_executor(
+                None, 
+                emotion_analyzer.analyze_video_with_eye_tracking, 
+                temp_filename
+            )
+            return combined_results
+        
+        # 3. Run both analyses in parallel for speed
+        print("🚀 Starting parallel analysis (Gemini + Emotions + Eye Tracking + Drowsiness)...")
+        ai_data, combined_data = await asyncio.gather(
+            run_gemini_analysis(),
+            run_emotion_analysis()
+        )
+        
+        # Extract emotion, eye tracking, and drowsiness data
+        emotion_data = combined_data.get("emotion_analysis", {})
+        eye_tracking_data = combined_data.get("eye_tracking", {})
+        drowsiness_data = combined_data.get("drowsiness", {})
+        
+        # Merge Results
+        final_response = {
+            "ai_analysis": ai_data,
+            "emotion_analysis": emotion_data,
+            "eye_tracking": eye_tracking_data,
+            "drowsiness": drowsiness_data
+        }
+        
+        return final_response
+
+    except Exception as e:
+        err_msg = str(e)
+        print(f"❌ ERROR: {err_msg}")
+        return {"status": "error", "message": err_msg}
+
+# --- ROUTE 3: GENERATE BOOTCAMP PLAN ---
+@app.post("/generate_bootcamp_plan")
+async def generate_bootcamp_plan(
+    job_role: str = Form(...),
+    days: int = Form(...),
+    resume_text: str = Form("")
+):
+    """Generate a personalized N-day interview preparation roadmap."""
+    print(f"🗓️ Generating {days}-day bootcamp plan for: {job_role}")
+
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"status": "error", "message": "Missing API Key"}
+
+        client = genai.Client(api_key=api_key)
+
+        resume_context = f"\nCandidate Resume:\n{resume_text[:1500]}" if resume_text else ""
+
+        day_templates = {
+            1: "HR & Behavioral questions (Tell me about yourself, strengths/weaknesses, teamwork, conflict resolution)",
+            2: "Core Technical Concepts relevant to the role (fundamentals, theory, commonly tested topics)",
+            3: "Problem Solving & Scenario-Based questions (real-world challenges, how they'd handle situations)",
+            4: "Advanced Technical & Project-Based questions (deep dives, architecture, past projects, edge cases)",
+            5: "Full Mock Interview — mix of all above, simulating a real interview end-to-end"
+        }
+
+        actual_days = min(days, 5)
+        days_plan = []
+        for d in range(1, actual_days + 1):
+            days_plan.append(f"Day {d}: {day_templates.get(d, day_templates[5])}")
+
+        prompt = f"""
+You are an expert interview coach creating a personalized preparation plan.
+
+Target Role: {job_role}
+Days Until Interview: {actual_days}
+{resume_context}
+
+Generate a {actual_days}-day interview preparation roadmap. For each day, provide:
+- A short title (5 words max)
+- A focus description (1 sentence)
+- Exactly 5 interview questions tailored to that day's theme and the target role
+
+Day themes to follow:
+{chr(10).join(days_plan)}
+
+CRITICAL: Return ONLY valid JSON in this exact structure, no markdown:
+{{
+  "role": "{job_role}",
+  "total_days": {actual_days},
+  "plan": [
+    {{
+      "day": 1,
+      "title": "Day Title Here",
+      "focus": "What this day focuses on",
+      "questions": ["Q1?", "Q2?", "Q3?", "Q4?", "Q5?"]
+    }}
+  ]
+}}
+"""
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            plan_data = json.loads(text)
+            print(f"✅ Bootcamp plan generated for {actual_days} days")
+            return {"status": "success", "plan": plan_data}
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                return {"status": "error", "message": "API quota exceeded. Try again later."}
+            print(f"⚠️ Plan generation error: {e}")
+            return {"status": "error", "message": err}
+
+    except Exception as e:
+        print(f"❌ Bootcamp plan error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# --- ROUTE 4: PROCESS BOOTCAMP ANSWER ---
+@app.post("/process_bootcamp_answer")
+async def process_bootcamp_answer(
+    file: UploadFile = File(...),
+    question: str = Form("Tell me about yourself"),
+    day: int = Form(1),
+    job_role: str = Form("Software Engineer")
+):
+    """Process a bootcamp day answer — same AI analysis but with day context."""
+    print(f"🎓 Processing bootcamp Day {day} answer for: {question}")
+
+    try:
+        temp_filename = f"temp_bootcamp_day{day}.webm"
+        with open(temp_filename, "wb") as buffer:
+            buffer.write(await file.read())
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {"error": "Missing API Key"}
+
+        client = genai.Client(api_key=api_key)
+
+        async def run_gemini_bootcamp():
+            print("☁️ Uploading bootcamp video to Gemini...")
+            video_file = client.files.upload(file=temp_filename)
+
+            while video_file.state.name == "PROCESSING":
+                await asyncio.sleep(1)
+                video_file = client.files.get(name=video_file.name)
+
+            if video_file.state.name == "FAILED":
+                raise ValueError("Video processing failed.")
+
+            prompt = f"""
+You are an Interview Coach evaluating a Day {day} bootcamp practice session.
+Role: {job_role}
+Question: "{question}"
+
+Analyze the video response. Return ONLY valid JSON, no markdown:
+{{
+  "rating": (integer 1-100),
+  "feedback": (2-3 sentences of specific feedback),
+  "improved_answer": (how to say it better),
+  "follow_up_question": (a relevant next question for this role)
+}}
+"""
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[video_file, prompt]
+                    )
+                    break
+                except Exception as ex:
+                    err_str = str(ex)
+                    is_retryable = any(k in err_str.lower() for k in ["429", "quota", "resource_exhausted", "503", "unavailable"])
+                    if is_retryable and attempt < max_retries - 1:
+                        await asyncio.sleep(5)
+                    elif attempt == max_retries - 1 and is_retryable:
+                        raise Exception("API is currently experiencing high demand or quota limits. Please try again.")
+                    else:
+                        raise
+
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+
+        async def run_emotion_bootcamp():
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                emotion_analyzer.analyze_video_with_eye_tracking,
+                temp_filename
+            )
+
+        ai_data, combined_data = await asyncio.gather(
+            run_gemini_bootcamp(),
+            run_emotion_bootcamp()
+        )
+
+        return {
+            "ai_analysis": ai_data,
+            "emotion_analysis": combined_data.get("emotion_analysis", {}),
+            "eye_tracking": combined_data.get("eye_tracking", {}),
+            "drowsiness": combined_data.get("drowsiness", {})
+        }
+
+    except Exception as e:
+        print(f"❌ Bootcamp answer error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+================================================================================
+File: backend\emotion_recognition\drowsiness_detector.py
+================================================================================
+
+import cv2
+import numpy as np
+from scipy.spatial import distance as dist
+import os
+
+# Try to use MediaPipe Tasks API (0.10.x+)
+_MEDIAPIPE_AVAILABLE = False
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision as mp_vision
+    from mediapipe.tasks.python.vision import FaceLandmarkerOptions
+    _MEDIAPIPE_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ DrowsinessDetector: MediaPipe not available: {e}")
+
+class DrowsinessDetector:
+    """
+    Drowsiness detection using Eye Aspect Ratio (EAR) and Mouth Aspect Ratio (MAR).
+    Uses MediaPipe Face Mesh as primary, with dlib and OpenCV Haar cascades as fallbacks.
+    """
+
+    # EAR and MAR thresholds
+    EAR_THRESHOLD = 0.25       # Below this = eyes closing (default, can be calibrated)
+    MAR_THRESHOLD = 0.30       # Above this = yawning (genuine yawn; normal speech stays below 0.5)
+    CONSECUTIVE_FRAMES = 3     # Frames below threshold to count as blink/drowsy
+    YAWN_CONSECUTIVE = 8       # Frames above MAR threshold to count as yawn (~1.5s sustained at skip=6)
+
+    # MediaPipe landmark indices for EAR/MAR calculation
+    MP_LEFT_EYE = [33, 160, 158, 133, 153, 144]   # p1-p6
+    MP_RIGHT_EYE = [362, 385, 387, 263, 373, 380]  # p1-p6
+    MP_INNER_MOUTH = [78, 81, 13, 311, 308, 402, 14, 82]  # 8 inner lip points
+
+    def __init__(self):
+        """Initialize drowsiness detector with MediaPipe Tasks API, dlib, or fallback to OpenCV"""
+        self.use_dlib = False
+        self.use_mediapipe = False
+        self.face_landmarker = None
+        self.detector = None
+        self.predictor = None
+
+        # MediaPipe Tasks API as primary detector
+        if _MEDIAPIPE_AVAILABLE:
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'face_landmarker.task')
+            if os.path.exists(model_path):
+                try:
+                    base_opts = mp_tasks.BaseOptions(model_asset_path=model_path)
+                    options = FaceLandmarkerOptions(
+                        base_options=base_opts,
+                        output_face_blendshapes=False,
+                        output_facial_transformation_matrixes=False,
+                        num_faces=1,
+                        min_face_detection_confidence=0.5,
+                        min_face_presence_confidence=0.5,
+                        min_tracking_confidence=0.5,
+                        running_mode=mp_vision.RunningMode.IMAGE,
+                    )
+                    self.face_landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+                    self.use_mediapipe = True
+                    print("✅ Drowsiness Detector: Using MediaPipe Tasks FaceLandmarker (primary)")
+
+                    # ── Suppress mediapipe 0.10.x shutdown crash ──────────────
+                    # __del__ is looked up on the *type*, not the instance.
+                    # By swapping the instance's __class__ to a subclass with a
+                    # no-op __del__, Python GC never triggers the broken
+                    # serial_dispatcher → dispatcher_wrapper crash path.
+                    try:
+                        class _SafeFaceLandmarker(mp_vision.FaceLandmarker):
+                            def __del__(self):
+                                pass  # suppress the mediapipe 0.10.x crash
+                        self.face_landmarker.__class__ = _SafeFaceLandmarker
+                    except Exception:
+                        pass
+
+                except BaseException as e:
+                    # mediapipe 0.10.x C-extension can raise TypeError (not just Exception)
+                    # during create_from_options in some environments — catch everything
+                    print(f"⚠️ Drowsiness: FaceLandmarker init failed ({type(e).__name__}): {e}")
+                    self.face_landmarker = None
+                    self.use_mediapipe = False
+            else:
+                print(f"⚠️ Drowsiness: face_landmarker.task not found")
+        else:
+            print("⚠️ MediaPipe not available for drowsiness detection.")
+
+        # dlib as secondary
+        if not self.use_mediapipe:
+            try:
+                import dlib
+                model_path = self._find_shape_predictor()
+                if model_path:
+                    self.detector = dlib.get_frontal_face_detector()
+                    self.predictor = dlib.shape_predictor(model_path)
+                    self.use_dlib = True
+                    print("✅ Drowsiness Detector: Using dlib with 68-landmark predictor")
+                else:
+                    print("⚠️ dlib shape predictor not found. Downloading...")
+                    self._download_shape_predictor()
+                    model_path = self._find_shape_predictor()
+                    if model_path:
+                        self.detector = dlib.get_frontal_face_detector()
+                        self.predictor = dlib.shape_predictor(model_path)
+                        self.use_dlib = True
+                        print("✅ Drowsiness Detector: dlib predictor downloaded and loaded")
+                    else:
+                        print("⚠️ Could not load dlib predictor. Using OpenCV fallback.")
+            except ImportError:
+                print("⚠️ dlib not installed. Using OpenCV fallback for drowsiness detection.")
+
+        # OpenCV fallback detectors
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        self.eye_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_eye.xml'
+        )
+        # Mouth cascade for yawn detection
+        mouth_cascade_path = cv2.data.haarcascades + 'haarcascade_smile.xml'
+        self.mouth_cascade = cv2.CascadeClassifier(mouth_cascade_path)
+        print(f"   Mouth cascade loaded: {not self.mouth_cascade.empty()}")
+
+        # Per-user EAR calibration state
+        self._calibration_ears = []
+        self._calibrated_threshold = None
+        self._calibration_frames = 30
+
+    def reset(self):
+        """Clear calibration state between videos"""
+        self._calibration_ears = []
+        self._calibrated_threshold = None
+
+    @property
+    def ear_threshold(self):
+        """Returns calibrated EAR threshold or default"""
+        if self._calibrated_threshold is not None:
+            return self._calibrated_threshold
+        return self.EAR_THRESHOLD
+
+    def _calibrate_ear(self, ear_value):
+        """Collect EAR values from first N frames for per-user calibration"""
+        if len(self._calibration_ears) < self._calibration_frames:
+            self._calibration_ears.append(ear_value)
+            if len(self._calibration_ears) == self._calibration_frames:
+                baseline = np.mean(self._calibration_ears)
+                self._calibrated_threshold = baseline * 0.80
+                print(f"   EAR calibrated: baseline={baseline:.3f}, threshold={self._calibrated_threshold:.3f}")
+
+    def _find_shape_predictor(self):
+        """Find the dlib shape predictor model file"""
+        possible_paths = [
+            os.path.join(os.path.dirname(__file__), 'shape_predictor_68_face_landmarks.dat'),
+            os.path.join(os.path.dirname(__file__), '..', 'shape_predictor_68_face_landmarks.dat'),
+            os.path.join(os.path.dirname(__file__), '..', 'data', 'shape_predictor_68_face_landmarks.dat'),
+            'shape_predictor_68_face_landmarks.dat',
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _download_shape_predictor(self):
+        """Download the dlib shape predictor model"""
+        import urllib.request
+        import bz2
+
+        url = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+        bz2_path = os.path.join(os.path.dirname(__file__), 'shape_predictor_68_face_landmarks.dat.bz2')
+        dat_path = os.path.join(os.path.dirname(__file__), 'shape_predictor_68_face_landmarks.dat')
+
+        try:
+            print("📥 Downloading shape predictor model (~100MB)...")
+            urllib.request.urlretrieve(url, bz2_path)
+
+            print("📦 Extracting model...")
+            with bz2.BZ2File(bz2_path) as fr, open(dat_path, 'wb') as fw:
+                fw.write(fr.read())
+
+            # Clean up bz2 file
+            os.remove(bz2_path)
+            print("✅ Shape predictor model ready!")
+        except Exception as e:
+            print(f"❌ Failed to download shape predictor: {e}")
+
+    def _eye_aspect_ratio(self, eye_points):
+        """
+        Calculate Eye Aspect Ratio (EAR).
+
+        EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+
+        When eyes are open: EAR ≈ 0.25-0.30
+        When eyes are closed: EAR ≈ 0.05
+        """
+        # Vertical distances
+        A = dist.euclidean(eye_points[1], eye_points[5])
+        B = dist.euclidean(eye_points[2], eye_points[4])
+        # Horizontal distance
+        C = dist.euclidean(eye_points[0], eye_points[3])
+
+        if C == 0:
+            return 0.0
+
+        ear = (A + B) / (2.0 * C)
+        return ear
+
+    def _mouth_aspect_ratio(self, mouth_points):
+        """
+        Calculate Mouth Aspect Ratio (MAR) for yawn detection.
+
+        MAR = (|p2-p8| + |p3-p7| + |p4-p6|) / (3 * |p1-p5|)
+
+        When mouth is closed: MAR ≈ 0.1-0.2
+        When yawning: MAR > 0.3
+        """
+        # Vertical distances (inner lip points)
+        A = dist.euclidean(mouth_points[1], mouth_points[7])
+        B = dist.euclidean(mouth_points[2], mouth_points[6])
+        C = dist.euclidean(mouth_points[3], mouth_points[5])
+        # Horizontal distance
+        D = dist.euclidean(mouth_points[0], mouth_points[4])
+
+        if D == 0:
+            return 0.0
+
+        mar = (A + B + C) / (3.0 * D)
+        return mar
+
+    def _get_landmarks_points(self, shape, indices):
+        """Extract landmark points as numpy array"""
+        points = []
+        for i in indices:
+            points.append([shape.part(i).x, shape.part(i).y])
+        return np.array(points)
+
+    def _get_mp_landmark_points(self, landmarks, indices, frame_shape):
+        """Extract MediaPipe landmark points as numpy array"""
+        h, w = frame_shape[:2]
+        points = []
+        for idx in indices:
+            lm = landmarks[idx]
+            points.append([lm.x * w, lm.y * h])
+        return np.array(points)
+
+    def process_frame(self, gray, rgb_frame, landmarks, frame_shape):
+        """
+        Single-frame API for the unified inference pipeline.
+        Accepts landmarks from eye_tracker to avoid duplicate face detection.
+        Returns dict with ear, mar, eyes_closed, yawning or None.
+        """
+        if landmarks is not None:
+            # Use provided MediaPipe landmarks
+            left_eye = self._get_mp_landmark_points(landmarks, self.MP_LEFT_EYE, frame_shape)
+            right_eye = self._get_mp_landmark_points(landmarks, self.MP_RIGHT_EYE, frame_shape)
+            left_ear = self._eye_aspect_ratio(left_eye)
+            right_ear = self._eye_aspect_ratio(right_eye)
+            avg_ear = (left_ear + right_ear) / 2.0
+
+            # Calibrate
+            self._calibrate_ear(avg_ear)
+
+            # Mouth
+            inner_mouth = self._get_mp_landmark_points(landmarks, self.MP_INNER_MOUTH, frame_shape)
+            mar = self._mouth_aspect_ratio(inner_mouth)
+
+            eyes_closed = avg_ear < self.ear_threshold
+            yawning = mar > self.MAR_THRESHOLD
+
+            return {
+                "ear": avg_ear,
+                "mar": mar,
+                "eyes_closed": eyes_closed,
+                "yawning": yawning,
+                "landmarks": landmarks  # pass-through so caller can reuse
+            }
+
+        # Fallback: use MediaPipe Tasks API internally
+        if self.use_mediapipe and self.face_landmarker is not None:
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                result = self.face_landmarker.detect(mp_image)
+                if result.face_landmarks and len(result.face_landmarks) > 0:
+                    mp_landmarks = result.face_landmarks[0]
+                    # Pass landmarks so recursive call includes them in result
+                    return self.process_frame(gray, rgb_frame, mp_landmarks, frame_shape)
+            except Exception as e:
+                print(f"⚠️ Drowsiness detect error: {e}")
+
+        # Fallback: dlib
+        if self.use_dlib and self.detector and self.predictor:
+            faces = self.detector(gray, 0)
+            if len(faces) > 0:
+                face = faces[0]
+                shape = self.predictor(gray, face)
+                left_eye = self._get_landmarks_points(shape, range(36, 42))
+                right_eye = self._get_landmarks_points(shape, range(42, 48))
+                left_ear = self._eye_aspect_ratio(left_eye)
+                right_ear = self._eye_aspect_ratio(right_eye)
+                avg_ear = (left_ear + right_ear) / 2.0
+                self._calibrate_ear(avg_ear)
+
+                inner_mouth = self._get_landmarks_points(shape, range(60, 68))
+                mar = self._mouth_aspect_ratio(inner_mouth)
+
+                return {
+                    "ear": avg_ear,
+                    "mar": mar,
+                    "eyes_closed": avg_ear < self.ear_threshold,
+                    "yawning": mar > self.MAR_THRESHOLD
+                }
+
+        return None
+
+    def analyze_video(self, video_path):
+        """
+        Analyze video for drowsiness indicators.
+        Returns alertness metrics and coaching feedback.
+        """
+        cap = cv2.VideoCapture(video_path)
+
+        if not cap.isOpened():
+            return self._error_result("Could not open video file")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_video_frames / fps if fps > 0 else 0
+
+        # Tracking variables
+        total_frames_analyzed = 0
+        frames_with_face = 0
+
+        # EAR tracking
+        ear_values = []
+        frames_eyes_closed = 0
+        total_eye_frames = 0
+
+        # Blink tracking
+        blink_count = 0
+        consecutive_closed = 0
+        was_closed = False
+
+        # Yawn tracking
+        yawn_count = 0
+        consecutive_yawn = 0
+        mar_values = []
+
+        frame_count = 0
+        skip_frames = 3  # Analyze every 3rd frame
+
+        print(f"😴 Starting drowsiness analysis for: {video_path}")
+        print(f"   Video: {total_video_frames} frames, {video_duration:.1f}s, {fps:.0f} FPS")
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+            if frame_count % skip_frames != 0:
+                continue
+
+            total_frames_analyzed += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            if self.use_dlib and self.detector and self.predictor:
+                # === dlib-based analysis (more accurate) ===
+                faces = self.detector(gray, 0)
+
+                if len(faces) > 0:
+                    frames_with_face += 1
+                    face = faces[0]
+                    shape = self.predictor(gray, face)
+
+                    # Eye landmarks: left eye (36-41), right eye (42-47)
+                    left_eye = self._get_landmarks_points(shape, range(36, 42))
+                    right_eye = self._get_landmarks_points(shape, range(42, 48))
+
+                    left_ear = self._eye_aspect_ratio(left_eye)
+                    right_ear = self._eye_aspect_ratio(right_eye)
+                    avg_ear = (left_ear + right_ear) / 2.0
+                    ear_values.append(avg_ear)
+                    total_eye_frames += 1
+
+                    # Check if eyes are closing
+                    if avg_ear < self.EAR_THRESHOLD:
+                        frames_eyes_closed += 1
+                        consecutive_closed += 1
+
+                        if consecutive_closed >= self.CONSECUTIVE_FRAMES and not was_closed:
+                            blink_count += 1
+                            was_closed = True
+                    else:
+                        consecutive_closed = 0
+                        was_closed = False
+
+                    # Mouth landmarks: inner lip (60-67)
+                    inner_mouth = self._get_landmarks_points(shape, range(60, 68))
+                    mar = self._mouth_aspect_ratio(inner_mouth)
+                    mar_values.append(mar)
+
+                    # Check for yawning
+                    if mar > self.MAR_THRESHOLD:
+                        consecutive_yawn += 1
+                        if consecutive_yawn == self.YAWN_CONSECUTIVE:
+                            yawn_count += 1
+                    else:
+                        consecutive_yawn = 0
+            else:
+                # === OpenCV fallback (with mouth/yawn detection) ===
+                faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+
+                if len(faces) > 0:
+                    frames_with_face += 1
+                    (x, y, w, h) = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
+
+                    roi_gray = gray[y:y+h, x:x+w]
+
+                    # --- Eye detection ---
+                    # Only look in top 60% of face for eyes
+                    eye_region = roi_gray[0:int(h*0.6), :]
+                    eyes = self.eye_cascade.detectMultiScale(eye_region, 1.1, 5)
+                    total_eye_frames += 1
+
+                    if len(eyes) < 2:
+                        # Less than 2 eyes detected = possibly closed/drowsy
+                        frames_eyes_closed += 1
+                        consecutive_closed += 1
+
+                        if consecutive_closed >= self.CONSECUTIVE_FRAMES and not was_closed:
+                            blink_count += 1
+                            was_closed = True
+                    else:
+                        consecutive_closed = 0
+                        was_closed = False
+
+                        # Estimate EAR from eye detection dimensions
+                        for (ex, ey, ew, eh) in eyes[:2]:
+                            ear_approx = eh / (ew + 0.001)
+                            ear_values.append(ear_approx)
+
+                    # --- Mouth/Yawn detection ---
+                    # Look at bottom 50% of face for mouth
+                    mouth_y_start = int(h * 0.5)
+                    mouth_region = roi_gray[mouth_y_start:, :]
+
+                    if mouth_region.size > 0:
+                        # Detect mouth openings
+                        mouths = self.mouth_cascade.detectMultiScale(
+                            mouth_region,
+                            scaleFactor=1.7,
+                            minNeighbors=11,
+                            minSize=(int(w*0.25), int(h*0.1))
+                        )
+
+                        if len(mouths) > 0:
+                            # Get the largest mouth detection
+                            (mx, my, mw, mh) = sorted(mouths, key=lambda m: m[2]*m[3], reverse=True)[0]
+
+                            # Calculate mouth aspect ratio from bounding box
+                            mar_approx = mh / (mw + 0.001)
+                            mar_values.append(mar_approx)
+
+                            # Yawn: mouth is open very wide (genuine yawn, not just talking)
+                            if mar_approx > self.MAR_THRESHOLD:
+                                consecutive_yawn += 1
+                                if consecutive_yawn == self.YAWN_CONSECUTIVE:
+                                    yawn_count += 1
+                                    print(f"   🥱 Yawn detected! (MAR: {mar_approx:.2f}) Total: {yawn_count}")
+                            else:
+                                consecutive_yawn = 0
+                        else:
+                            consecutive_yawn = 0
+
+            if total_frames_analyzed % 50 == 0:
+                print(f"   ...Processed {total_frames_analyzed} frames for drowsiness...")
+
+        cap.release()
+        print(f"✅ Drowsiness analysis complete. Analyzed {frames_with_face} frames with faces.")
+
+        # Calculate metrics
+        if frames_with_face == 0:
+            return self._error_result("No faces detected for drowsiness analysis")
+
+        # PERCLOS: Percentage of time eyes are closed
+        perclos = round((frames_eyes_closed / total_eye_frames) * 100, 1) if total_eye_frames > 0 else 0
+
+        # Average EAR
+        avg_ear = round(np.mean(ear_values), 3) if ear_values else 0.25
+
+        # Blink rate (blinks per minute)
+        blink_rate = round((blink_count / video_duration) * 60, 1) if video_duration > 0 else 0
+
+        # Calculate alertness score (0-100)
+        alertness_score = self._calculate_alertness_score(perclos, yawn_count, blink_rate, avg_ear)
+
+        # Determine drowsiness level
+        drowsiness_level = self._get_drowsiness_level(alertness_score)
+
+        # Generate coaching feedback
+        feedback = self._generate_feedback(alertness_score, drowsiness_level, yawn_count, blink_rate, perclos)
+
+        return {
+            "alertness_score": alertness_score,
+            "drowsiness_level": drowsiness_level,
+            "yawn_count": yawn_count,
+            "blink_rate": blink_rate,
+            "perclos": perclos,
+            "avg_ear": avg_ear,
+            "coaching_feedback": feedback
+        }
+
+    def _calculate_alertness_score(self, perclos, yawn_count, blink_rate, avg_ear):
+        """Calculate overall alertness score (0-100)"""
+        score = 100
+
+        # PERCLOS penalty (biggest indicator)
+        if perclos > 40:
+            score -= 40
+        elif perclos > 25:
+            score -= 25
+        elif perclos > 15:
+            score -= 15
+        elif perclos > 8:
+            score -= 5
+
+        # Yawn penalty
+        score -= min(yawn_count * 8, 25)
+
+        # Blink rate penalty (normal: 12-20/min)
+        if blink_rate > 25:
+            score -= 15  # Excessive blinking = fatigue
+        elif blink_rate > 20:
+            score -= 5
+        elif blink_rate < 8 and blink_rate > 0:
+            score -= 5   # Too few blinks = staring/zoned out
+
+        # EAR penalty (low average = droopy eyes)
+        if avg_ear < 0.20:
+            score -= 15
+        elif avg_ear < 0.22:
+            score -= 8
+
+        return max(0, min(100, round(score)))
+
+    def _get_drowsiness_level(self, alertness_score):
+        """Determine drowsiness level from alertness score"""
+        if alertness_score >= 80:
+            return "Alert"
+        elif alertness_score >= 60:
+            return "Mild Drowsiness"
+        elif alertness_score >= 40:
+            return "Moderate Drowsiness"
+        else:
+            return "Severe Drowsiness"
+
+    def _generate_feedback(self, score, level, yawn_count, blink_rate, perclos):
+        """Generate personalized coaching feedback"""
+        feedback = []
+
+        # Overall assessment
+        if score >= 80:
+            feedback.append(f"✅ You appeared alert and energetic! Alertness score: {score}/100.")
+        elif score >= 60:
+            feedback.append(f"⚠️ Mild signs of drowsiness detected. Alertness score: {score}/100.")
+        elif score >= 40:
+            feedback.append(f"⚠️ Moderate drowsiness detected. Alertness score: {score}/100. This could impact your interview impression.")
+        else:
+            feedback.append(f"🚨 Signs of significant drowsiness detected. Alertness score: {score}/100. Consider resting before interviews.")
+
+        # Yawn feedback
+        if yawn_count == 0:
+            feedback.append("No yawning detected — great energy!")
+        elif yawn_count <= 2:
+            feedback.append(f"You yawned {yawn_count} time(s). This could signal tiredness to interviewers.")
+        else:
+            feedback.append(f"You yawned {yawn_count} times. Frequent yawning may give a negative impression. Ensure you're well-rested.")
+
+        # Blink rate feedback
+        if 12 <= blink_rate <= 20:
+            feedback.append(f"Blink rate is normal ({blink_rate}/min).")
+        elif blink_rate > 20:
+            feedback.append(f"High blink rate ({blink_rate}/min) may indicate fatigue or stress.")
+        elif blink_rate > 0:
+            feedback.append(f"Low blink rate ({blink_rate}/min). Try to blink naturally to avoid appearing tense.")
+
+        # PERCLOS feedback
+        if perclos > 20:
+            feedback.append(f"Your eyes were closed {perclos}% of the time. Keep your eyes open wide to appear engaged.")
+
+        # General tips for low scores
+        if score < 70:
+            feedback.append("💡 Tip: Get adequate sleep, stay hydrated, and do light stretches before your interview.")
+
+        return feedback
+
+    def _error_result(self, message):
+        """Return error result with default values"""
+        return {
+            "error": message,
+            "alertness_score": 0,
+            "drowsiness_level": "Unknown",
+            "yawn_count": 0,
+            "blink_rate": 0,
+            "perclos": 0,
+            "avg_ear": 0,
+            "coaching_feedback": [f"⚠️ {message}. Ensure good lighting and face visibility."]
+        }
+
+
+================================================================================
+File: backend\emotion_recognition\eye_tracker.py
+================================================================================
+
+import cv2
+import numpy as np
+import os
+from collections import deque
+
+# ─── API availability ─────────────────────────────────────────────────────────
+_FACE_MESH_AVAILABLE = False
+_TASKS_AVAILABLE     = False
+_mp_module = None
+
+try:
+    import mediapipe as mp
+    _mp_module = mp
+
+    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
+        _FACE_MESH_AVAILABLE = True
+        print("✅ EyeTracker: mp.solutions.face_mesh available")
+
+    try:
+        from mediapipe.tasks import python as mp_tasks
+        from mediapipe.tasks.python import vision as mp_vision
+        from mediapipe.tasks.python.vision import FaceLandmarkerOptions
+        _TASKS_AVAILABLE = True
+    except Exception:
+        pass
+
+except Exception as e:
+    print(f"⚠️ EyeTracker: MediaPipe not available: {e}")
+
+
+class EyeTracker:
+    """
+    Eye-contact tracker for interview coaching.
+
+    PRIMARY signal  — nose centering between eye corners:
+        When you face the camera your nose sits ~0.5 of the way between
+        the outer eye corners.  Head turns shift the nose clearly off-centre.
+        This gives a strong, reliable look-away signal that iris-ratio cannot.
+
+    SECONDARY signal — iris-within-eye ratio (catches eye-only gaze shifts).
+
+    Both signals are checked; either one failing means "looking away".
+    """
+
+    # ── Landmark indices (works for both FaceMesh and FaceLandmarker) ─────────
+    LEFT_IRIS   = [469, 470, 471, 472]
+    RIGHT_IRIS  = [474, 475, 476, 477]
+    LEFT_EYE    = [33,  133, 160, 159, 158, 144, 145, 153]  # [0]=outer, [1]=inner
+    RIGHT_EYE   = [263, 362, 387, 386, 385, 373, 374, 380]  # [0]=outer, [1]=inner
+    NOSE_TIP    = 4    # actual nose tip (more forward than landmark 1)
+    L_EYE_OUT   = 33   # left  eye outer corner (temple side)
+    R_EYE_OUT   = 263  # right eye outer corner (temple side)
+
+    # ── Thresholds ────────────────────────────────────────────────────────────
+    # Nose centering: 0 = at left eye corner, 1 = at right eye corner
+    # When facing camera nose is ~0.5; outside 0.35–0.65 → head turned
+    NOSE_CENTER_MIN = 0.35
+    NOSE_CENTER_MAX = 0.65
+    # Iris ratio: 0.35–0.65 = looking at camera
+    IRIS_RATIO_MIN  = 0.30
+    IRIS_RATIO_MAX  = 0.70
+
+    def __init__(self):
+        self.face_mesh       = None
+        self.face_landmarker = None
+        self.use_face_mesh   = False
+        self.use_tasks       = False
+
+        self.gaze_history = deque(maxlen=30)
+        self._gaze_window = deque(maxlen=3)
+
+        # ── Classic FaceMesh (preferred — reference approach) ─────────────────
+        if _FACE_MESH_AVAILABLE:
+            try:
+                self.face_mesh = _mp_module.solutions.face_mesh.FaceMesh(
+                    max_num_faces=1,
+                    refine_landmarks=True,   # enables iris landmarks 469-477
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                self.use_face_mesh = True
+                print("✅ EyeTracker: FaceMesh initialised")
+            except Exception as e:
+                print(f"⚠️ EyeTracker: FaceMesh init failed: {e}")
+
+        # ── Tasks API fallback ────────────────────────────────────────────────
+        # NOTE: Skipped intentionally. In the main pipeline, EyeTracker always
+        # receives landmarks shared from DrowsinessDetector (which has its own
+        # FaceLandmarker). Creating a second FaceLandmarker here causes a
+        # mediapipe C-library conflict and crashes the backend on startup.
+        # The Tasks API path in _detect_tasks() is only used by the standalone
+        # analyze_video() fallback, which is rarely triggered.
+        # To re-enable: set self.use_tasks = True and init self.face_landmarker.
+        self.use_tasks = False
+        self.face_landmarker = None
+
+        if not self.use_face_mesh and not self.use_tasks:
+            print("⚠️ EyeTracker: no MediaPipe API available (FaceMesh will be used if available)")
+
+    @property
+    def use_mediapipe(self):
+        return self.use_face_mesh or self.use_tasks
+
+    def reset(self):
+        self.gaze_history.clear()
+        self._gaze_window.clear()
+
+    # =========================================================================
+    # Geometry helpers
+    # =========================================================================
+
+    def _lm_px(self, lm, w, h):
+        """Landmark → pixel coords."""
+        return lm.x * w, lm.y * h
+
+    def get_iris_position(self, landmarks, iris_indices, frame_shape):
+        h, w = frame_shape[:2]
+        pts = [[landmarks[i].x * w, landmarks[i].y * h]
+               for i in iris_indices if i < len(landmarks)]
+        return np.mean(pts, axis=0) if pts else None
+
+    def get_eye_points(self, landmarks, eye_indices, frame_shape):
+        h, w = frame_shape[:2]
+        return [[landmarks[i].x * w, landmarks[i].y * h] for i in eye_indices]
+
+    def calculate_iris_ratio(self, eye_points, iris_center):
+        """
+        Iris position as fraction of horizontal eye width.
+        Uses index [0] (outer corner) and [1] (inner corner) — the true edges.
+        Returns ~0.5 when iris is centred.
+        """
+        p0 = np.array(eye_points[0], float)
+        p1 = np.array(eye_points[1], float)
+        lp, rp = (p0, p1) if p0[0] < p1[0] else (p1, p0)   # left → right
+        width = np.linalg.norm(rp - lp)
+        if width == 0:
+            return 0.5
+        return float(np.linalg.norm(np.array(iris_center, float) - lp) / width)
+
+    # =========================================================================
+    # PRIMARY SIGNAL: nose centering
+    # =========================================================================
+
+    def get_nose_centering(self, landmarks, frame_shape):
+        """
+        Returns the nose-tip x-position normalised by the span between the two
+        outer eye corners (0 = at left-screen corner, 1 = at right-screen corner).
+
+        Expected value when facing camera: ~0.45–0.55
+        Head turned to person's RIGHT  (nose shifts left on screen): value < 0.35
+        Head turned to person's LEFT   (nose shifts right on screen): value > 0.65
+        """
+        h, w = frame_shape[:2]
+        try:
+            nose_x = landmarks[self.NOSE_TIP].x * w
+            l_x    = landmarks[self.L_EYE_OUT].x * w
+            r_x    = landmarks[self.R_EYE_OUT].x * w
+            left_x, right_x = min(l_x, r_x), max(l_x, r_x)
+            span = right_x - left_x
+            if span < 10:
+                return None
+            return (nose_x - left_x) / span
+        except (IndexError, AttributeError):
+            return None
+
+    # =========================================================================
+    # Combined classifier
+    # =========================================================================
+
+    def _is_looking(self, landmarks, frame_shape):
+        """
+        True = looking at camera.
+        Uses nose centering (primary) + iris ratio (secondary).
+        """
+        h, w = frame_shape[:2]
+
+        # ── SIGNAL 1: nose centering (head-turn detector) ─────────────────────
+        nose_pos = self.get_nose_centering(landmarks, frame_shape)
+        if nose_pos is not None:
+            if nose_pos < self.NOSE_CENTER_MIN or nose_pos > self.NOSE_CENTER_MAX:
+                return False   # head clearly turned away
+
+        # ── SIGNAL 2: iris ratio (eye-only gaze shifts) ───────────────────────
+        if len(landmarks) >= 477:   # iris landmarks available
+            l_iris = self.get_iris_position(landmarks, self.LEFT_IRIS,  frame_shape)
+            r_iris = self.get_iris_position(landmarks, self.RIGHT_IRIS, frame_shape)
+            if l_iris is not None and r_iris is not None:
+                lp = self.get_eye_points(landmarks, self.LEFT_EYE,  frame_shape)
+                rp = self.get_eye_points(landmarks, self.RIGHT_EYE, frame_shape)
+                l_ratio = self.calculate_iris_ratio(lp, l_iris)
+                r_ratio = self.calculate_iris_ratio(rp, r_iris)
+                avg = (l_ratio + r_ratio) / 2.0
+                if avg < self.IRIS_RATIO_MIN or avg > self.IRIS_RATIO_MAX:
+                    return False   # eyes drifted off-centre
+
+        return True
+
+    def _smooth(self, raw: bool) -> bool:
+        """Majority vote over last 3 frames to dampen single-frame noise."""
+        self._gaze_window.append(raw)
+        if len(self._gaze_window) < 2:
+            return raw
+        trues  = sum(1 for v in self._gaze_window if v)
+        falses = len(self._gaze_window) - trues
+        return trues >= falses
+
+    def _make_result(self, landmarks, frame_shape):
+        """Run signals, smooth, and return result dict."""
+        looking_raw    = self._is_looking(landmarks, frame_shape)
+        looking        = self._smooth(looking_raw)
+        gaze_direction = "center" if looking else "away"
+        self.gaze_history.append(gaze_direction)
+        return {"gaze": gaze_direction, "looking_at_camera": looking}
+
+    # =========================================================================
+    # Public API used by inference.py (shared landmarks from DrowsinessDetector)
+    # =========================================================================
+
+    def analyze_gaze_from_landmarks(self, landmarks, frame_shape):
+        """Called by single-pass pipeline with pre-detected landmarks."""
+        if landmarks is None or len(landmarks) < 6:
+            return None
+        return self._make_result(landmarks, frame_shape)
+
+    # =========================================================================
+    # Public API — standalone per-frame (used in analyze_video below)
+    # =========================================================================
+
+    def process_frame(self, rgb_frame, frame_shape):
+        lms = self._detect_classic(rgb_frame) or self._detect_tasks(rgb_frame)
+        return self._make_result(lms, frame_shape) if lms else None
+
+    def _detect_classic(self, rgb_frame):
+        if not self.use_face_mesh or self.face_mesh is None:
+            return None
+        try:
+            r = self.face_mesh.process(rgb_frame)
+            if r.multi_face_landmarks:
+                return r.multi_face_landmarks[0].landmark
+        except Exception:
+            pass
+        return None
+
+    def _detect_tasks(self, rgb_frame):
+        if not self.use_tasks or self.face_landmarker is None or _mp_module is None:
+            return None
+        try:
+            img = _mp_module.Image(image_format=_mp_module.ImageFormat.SRGB, data=rgb_frame)
+            r   = self.face_landmarker.detect(img)
+            if r.face_landmarks:
+                return r.face_landmarks[0]
+        except Exception:
+            pass
+        return None
+
+    # =========================================================================
+    # Standalone video analysis
+    # =========================================================================
+
+    def analyze_video(self, video_path):
+        if not self.use_mediapipe:
+            return {
+                "error": "Eye tracking not available",
+                "eye_contact_percentage": 0,
+                "looking_away_count": 0,
+                "gaze_stability": "N/A",
+                "coaching_feedback": ["Eye tracking is currently unavailable."]
+            }
+
+        cap = cv2.VideoCapture(video_path)
+        frames_with_face = center_frames = consecutive_away = frame_count = 0
+        away_events = []
+        skip = 3
+        print(f"👁️ Eye tracking: {video_path}")
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_count += 1
+            if frame_count % skip != 0:
+                continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.process_frame(rgb, frame.shape)
+            if res:
+                frames_with_face += 1
+                if res["looking_at_camera"]:
+                    center_frames  += 1
+                    consecutive_away = 0
+                else:
+                    consecutive_away += 1
+                    if consecutive_away == 5:
+                        away_events.append(frame_count)
+
+        cap.release()
+        if frames_with_face == 0:
+            return {
+                "error": "No faces detected",
+                "eye_contact_percentage": 0,
+                "looking_away_count": 0,
+                "gaze_stability": "Unknown",
+                "coaching_feedback": ["Could not detect face. Ensure good lighting."]
+            }
+
+        pct   = round(center_frames / frames_with_face * 100, 1)
+        count = len(away_events)
+        stab  = ("Excellent" if pct >= 70 else "Good" if pct >= 50
+                 else "Fair" if pct >= 30 else "Needs Improvement")
+        return {
+            "eye_contact_percentage": pct,
+            "looking_away_count":     count,
+            "gaze_stability":         stab,
+            "coaching_feedback":      self.generate_coaching_feedback(pct, count, stab)
+        }
+
+    def generate_coaching_feedback(self, pct, away_count, stability):
+        fb = []
+        if pct >= 70:
+            fb.append(f"Excellent eye contact! You maintained {pct}% eye contact.")
+        elif pct >= 50:
+            fb.append(f"Good eye contact at {pct}%. Aim for 70%+ for stronger engagement.")
+        elif pct >= 30:
+            fb.append(f"Eye contact was {pct}%. Practice holding eye contact longer.")
+        else:
+            fb.append(f"Low eye contact ({pct}%). Focus on looking at the camera consistently.")
+
+        if away_count == 0:
+            fb.append("Great focus! You didn't look away during the response.")
+        elif away_count <= 2:
+            fb.append(f"You looked away {away_count} time(s). Try to minimise this.")
+        else:
+            fb.append(f"You looked away {away_count} times. Work on steady eye contact.")
+
+        if pct < 60:
+            fb.append("💡 Tip: Look directly at the camera lens as if making eye contact with the interviewer.")
+        return fb
+
+    def __del__(self):
+        for attr in ('face_mesh', 'face_landmarker'):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
+================================================================================
+File: backend\emotion_recognition\inference.py
+================================================================================
+
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from collections import deque
+import os
+import urllib.request
+from .eye_tracker import EyeTracker
+from .drowsiness_detector import DrowsinessDetector
+
+# Emotion Labels (must match training order)
+EMOTIONS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+
+class EmotionAnalyzer:
+    def __init__(self, model_path='emotion_cnn_model.h5'):
+        self.model = None
+        self.model_path = model_path
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.emotion_history = deque(maxlen=30) # Store last 30 frames for smoothing
+        self.eye_tracker = EyeTracker()  # Initialize eye tracker
+        self.drowsiness_detector = DrowsinessDetector()  # Initialize drowsiness detector
+
+        # DNN face detector (loaded lazily)
+        self._dnn_net = None
+        self._dnn_loaded = False
+
+        # CLAHE for preprocessing
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    def _ensure_dnn_detector(self):
+        """Load OpenCV DNN face detector (res10_300x300). Downloads on first use."""
+        if self._dnn_loaded:
+            return self._dnn_net is not None
+
+        self._dnn_loaded = True
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        prototxt_path = os.path.join(base_dir, 'deploy.prototxt')
+        caffemodel_path = os.path.join(base_dir, 'res10_300x300_ssd_iter_140000.caffemodel')
+
+        # Download if not present
+        if not os.path.exists(prototxt_path) or not os.path.exists(caffemodel_path):
+            try:
+                print("📥 Downloading DNN face detector model...")
+                prototxt_url = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+                caffemodel_url = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+
+                if not os.path.exists(prototxt_path):
+                    urllib.request.urlretrieve(prototxt_url, prototxt_path)
+                if not os.path.exists(caffemodel_path):
+                    urllib.request.urlretrieve(caffemodel_url, caffemodel_path)
+                print("✅ DNN face detector downloaded.")
+            except Exception as e:
+                print(f"⚠️ Could not download DNN face detector: {e}. Using Haar cascade fallback.")
+                return False
+
+        try:
+            self._dnn_net = cv2.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
+            print("✅ DNN face detector loaded.")
+            return True
+        except Exception as e:
+            print(f"⚠️ Could not load DNN face detector: {e}. Using Haar cascade fallback.")
+            return False
+
+    def _detect_face_dnn(self, frame, confidence_threshold=0.5):
+        """Detect face using DNN. Returns (x, y, w, h) or None."""
+        if self._dnn_net is None:
+            return None
+
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0,
+                                      (300, 300), (104.0, 177.0, 123.0))
+        self._dnn_net.setInput(blob)
+        detections = self._dnn_net.forward()
+
+        best_detection = None
+        best_confidence = confidence_threshold
+
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > best_confidence:
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (x1, y1, x2, y2) = box.astype("int")
+                # Clamp to frame bounds
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(w, x2)
+                y2 = min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    best_confidence = confidence
+                    best_detection = (x1, y1, x2 - x1, y2 - y1)
+
+        return best_detection
+
+    def _detect_face(self, frame, gray):
+        """Detect face using DNN first, Haar cascade fallback. Returns (x, y, w, h) or None."""
+        # Try DNN
+        if self._dnn_net is not None:
+            result = self._detect_face_dnn(frame)
+            if result is not None:
+                return result
+
+        # Haar cascade fallback
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        if len(faces) > 0:
+            faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
+            return tuple(faces[0])
+
+        return None
+
+    def load_saved_model(self):
+        """Load model with backward compatibility: full model → v2 weights → v1 weights"""
+        if os.path.exists(self.model_path):
+            # Try 1: Load full saved model
+            try:
+                self.model = load_model(self.model_path)
+                print("✅ Emotion Model Loaded Successfully")
+                return True
+            except Exception as e:
+                print(f"⚠️ Full model load failed: {e}. Trying architecture + weights...")
+
+            # Try 2: V2 architecture + weights
+            try:
+                from .model import create_emotion_model_v2
+                self.model = create_emotion_model_v2(input_shape=(48, 48, 1), num_classes=7)
+                self.model.load_weights(self.model_path)
+                print("✅ Emotion Model Loaded (V2 architecture + weights)")
+                return True
+            except Exception as e:
+                print(f"⚠️ V2 architecture load failed: {e}. Trying V1...")
+
+            # Try 3: V1 architecture + weights
+            try:
+                from .model import create_emotion_model
+                self.model = create_emotion_model(input_shape=(48, 48, 1), num_classes=7)
+                self.model.load_weights(self.model_path)
+                print("✅ Emotion Model Loaded (V1 architecture + weights)")
+                return True
+            except Exception as e:
+                print(f"❌ Failed to load model with any method: {e}")
+                return False
+        else:
+            print(f"⚠️ Model file not found at {self.model_path}. Please run train.py first.")
+            return False
+
+    def preprocess_face(self, face_img):
+        # Convert to grayscale if not already
+        if len(face_img.shape) == 3:
+            face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+
+        # Apply CLAHE for better contrast
+        face_img = self._clahe.apply(face_img)
+
+        # Resize to 48x48
+        face_img = cv2.resize(face_img, (48, 48))
+
+        # Normalize
+        face_img = face_img / 255.0
+
+        # Reshape for model (1, 48, 48, 1)
+        face_img = np.expand_dims(face_img, axis=0)
+        face_img = np.expand_dims(face_img, axis=-1)
+
+        return face_img
+
+    def analyze_video(self, video_path):
+        """
+        Analyzes a video file for facial expressions.
+        Returns a summary of emotions and coaching tips.
+        """
+        if self.model is None:
+            if not self.load_saved_model():
+                return {"error": "Emotion model not loaded. Please train the model first."}
+
+        cap = cv2.VideoCapture(video_path)
+        emotion_counts = {emotion: 0 for emotion in EMOTIONS}
+        total_frames = 0
+
+        frame_count = 0
+        skip_frames = 12  # Analyze every 12th frame for faster processing
+        max_analyzed_frames = 100  # Stop after analyzing 100 frames (enough for accurate summary)
+
+        print(f"🎬 Starting analysis for: {video_path}")
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Early stopping if we've analyzed enough frames
+            if total_frames >= max_analyzed_frames:
+                print(f"✅ Reached {max_analyzed_frames} analyzed frames. Stopping early for efficiency.")
+                break
+
+            frame_count += 1
+            if frame_count % skip_frames != 0:
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+
+            if len(faces) > 0:
+                 # Only take the largest face
+                faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
+                (x, y, w, h) = faces[0]
+
+                roi_gray = gray[y:y+h, x:x+w]
+                processed_face = self.preprocess_face(roi_gray)
+
+                prediction = self.model.predict(processed_face, verbose=0)
+                max_index = int(np.argmax(prediction))
+                predicted_emotion = EMOTIONS[max_index]
+
+                emotion_counts[predicted_emotion] += 1
+                total_frames += 1
+
+            if frame_count % 30 == 0:
+                print(f"   ...Processed {frame_count} frames...")
+
+        cap.release()
+        print(f"✅ Analysis Complete. Analyzed {total_frames} face frames.")
+
+        if total_frames == 0:
+            return {"message": "No faces detected in video."}
+
+        # Calculate percentages
+        emotion_summary = {k: round((v / total_frames) * 100, 2) for k, v in emotion_counts.items()}
+        dominant_emotion = max(emotion_summary, key=emotion_summary.get)
+
+        # Coaching Logic
+        feedback = self.generate_feedback(dominant_emotion, emotion_summary)
+
+        return {
+            "dominant_emotion": dominant_emotion,
+            "emotion_breakdown": emotion_summary,
+            "coaching_feedback": feedback
+        }
+
+    def generate_feedback(self, dominant, summary):
+        feedback = []
+
+        if dominant in ['Fear', 'Sad', 'Angry']:
+            feedback.append(f"We detected a lot of {dominant} ({summary[dominant]}%). Try to relax and smile more.")
+
+        if summary.get('Happy', 0) < 10:
+            feedback.append("You didn't smile much. A warm smile helps build rapport.")
+
+        if summary.get('Neutral', 0) > 80:
+            feedback.append("Your expression was mostly static. Try to be more expressive to engage the interviewer.")
+
+        if not feedback:
+            feedback.append("Great job! Your facial expressions looked confident and positive.")
+
+        return feedback
+
+    def analyze_video_single_pass(self, video_path):
+        """
+        Single-pass video analysis: read frames once, share across all analyzers.
+        Uses DNN face detection, CLAHE preprocessing, confidence thresholding,
+        and temporal smoothing for improved accuracy.
+        """
+        print("🎯 Running single-pass analysis pipeline...")
+
+        if self.model is None:
+            if not self.load_saved_model():
+                return None  # Will trigger fallback
+
+        # Ensure DNN detector is ready
+        self._ensure_dnn_detector()
+
+        # Reset per-video state
+        self.eye_tracker.reset()
+        self.drowsiness_detector.reset()
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_video_frames / fps if fps > 0 else 0
+
+        # Emotion tracking — probability arrays for weighted averaging
+        emotion_prob_arrays = []
+        emotion_weights = []
+
+        # Eye tracking
+        eye_center_frames = 0
+        eye_frames_with_face = 0
+        eye_looking_away_events = []
+        eye_consecutive_away = 0
+
+        # Drowsiness tracking
+        ear_values = []
+        frames_eyes_closed = 0
+        total_eye_frames = 0
+        blink_count = 0
+        consecutive_closed = 0
+        was_closed = False
+        yawn_count = 0
+        consecutive_yawn = 0
+        mar_values = []
+
+        frame_count = 0
+        analyzed_frames = 0
+        skip_frames = 6   # Analyze every 6th frame (2x more than old pipeline)
+        max_frames = 200
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if analyzed_frames >= max_frames:
+                print(f"✅ Reached {max_frames} analyzed frames. Stopping.")
+                break
+
+            frame_count += 1
+            if frame_count % skip_frames != 0:
+                continue
+
+            analyzed_frames += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # --- Drowsiness Detection runs FIRST (it reliably detects faces) ---
+            # Pass mp_landmarks=None so it uses its own FaceLandmarker to detect
+            drowsy_result = self.drowsiness_detector.process_frame(
+                gray, rgb_frame, None, frame.shape
+            )
+            shared_landmarks = None  # Will be populated after drowsiness detection
+
+            if drowsy_result is not None:
+                ear_values.append(drowsy_result["ear"])
+                total_eye_frames += 1
+                # Grab landmarks from drowsiness detector for eye tracking reuse
+                shared_landmarks = drowsy_result.get("landmarks")
+
+                if drowsy_result["eyes_closed"]:
+                    frames_eyes_closed += 1
+                    consecutive_closed += 1
+                    if consecutive_closed >= self.drowsiness_detector.CONSECUTIVE_FRAMES and not was_closed:
+                        blink_count += 1
+                        was_closed = True
+                else:
+                    consecutive_closed = 0
+                    was_closed = False
+
+                mar_values.append(drowsy_result["mar"])
+                if drowsy_result["yawning"]:
+                    consecutive_yawn += 1
+                    if consecutive_yawn == self.drowsiness_detector.YAWN_CONSECUTIVE:
+                        yawn_count += 1
+                else:
+                    consecutive_yawn = 0
+
+            # --- Eye Tracking: reuse landmarks from DrowsinessDetector ---
+            if shared_landmarks is not None:
+                eye_result = self.eye_tracker.analyze_gaze_from_landmarks(
+                    shared_landmarks, frame.shape
+                )
+                if eye_result is not None:
+                    eye_frames_with_face += 1
+                    if eye_result["looking_at_camera"]:
+                        eye_center_frames += 1
+                        eye_consecutive_away = 0
+                    else:
+                        eye_consecutive_away += 1
+                        if eye_consecutive_away == 3:  # Reduced: ~0.6s of looking away counts
+                            eye_looking_away_events.append(frame_count)
+
+            # --- Emotion Detection (shared face detection) ---
+            face_rect = self._detect_face(frame, gray)
+            if face_rect is not None and self.model is not None:
+                (x, y, w, h) = face_rect
+                roi_gray = gray[y:y+h, x:x+w]
+                if roi_gray.size > 0:
+                    processed_face = self.preprocess_face(roi_gray)
+                    prediction = self.model.predict(processed_face, verbose=0)[0]
+
+                    # Confidence thresholding
+                    max_confidence = float(np.max(prediction))
+                    if max_confidence > 0.4:
+                        # Weight by recency (later frames weighted higher)
+                        weight = 0.5 + 0.5 * (analyzed_frames / max_frames)
+                        emotion_prob_arrays.append(prediction)
+                        emotion_weights.append(weight)
+
+            if analyzed_frames % 50 == 0:
+                print(f"   ...Single-pass: processed {analyzed_frames} frames...")
+
+        cap.release()
+        print(f"✅ Single-pass analysis complete. {analyzed_frames} frames analyzed.")
+
+        # --- Compute Results ---
+        emotion_results = self._compute_emotion_results(emotion_prob_arrays, emotion_weights)
+        eye_results = self._compute_eye_results(
+            eye_center_frames, eye_frames_with_face, eye_looking_away_events
+        )
+        drowsiness_results = self._compute_drowsiness_results(
+            ear_values, frames_eyes_closed, total_eye_frames,
+            blink_count, yawn_count, mar_values, video_duration
+        )
+
+        return {
+            "emotion_analysis": emotion_results,
+            "eye_tracking": eye_results,
+            "drowsiness": drowsiness_results
+        }
+
+    def _compute_emotion_results(self, prob_arrays, weights):
+        """Compute emotion results from weighted probability arrays."""
+        if not prob_arrays:
+            return {"message": "No faces detected in video."}
+
+        # Weighted average of probability arrays
+        prob_arrays = np.array(prob_arrays)
+        weights = np.array(weights)
+        weights = weights / weights.sum()  # Normalize
+
+        avg_probs = np.average(prob_arrays, axis=0, weights=weights)
+
+        # Convert to percentages
+        emotion_summary = {}
+        for i, emotion in enumerate(EMOTIONS):
+            emotion_summary[emotion] = round(float(avg_probs[i]) * 100, 2)
+
+        dominant_emotion = max(emotion_summary, key=emotion_summary.get)
+        feedback = self.generate_feedback(dominant_emotion, emotion_summary)
+
+        return {
+            "dominant_emotion": dominant_emotion,
+            "emotion_breakdown": emotion_summary,
+            "coaching_feedback": feedback
+        }
+
+    def _compute_eye_results(self, center_frames, frames_with_face, looking_away_events):
+        """Compute eye tracking results using same thresholds as EyeTracker."""
+        if frames_with_face == 0:
+            return {
+                "error": "No faces detected for eye tracking",
+                "eye_contact_percentage": 0,
+                "looking_away_count": 0,
+                "gaze_stability": "Unknown",
+                "coaching_feedback": ["Could not detect eyes in the video. Ensure your face is clearly visible."]
+            }
+
+        eye_contact_percentage = round((center_frames / frames_with_face) * 100, 1)
+        looking_away_count = len(looking_away_events)
+
+        if eye_contact_percentage >= 70:
+            gaze_stability = "Excellent"
+        elif eye_contact_percentage >= 50:
+            gaze_stability = "Good"
+        elif eye_contact_percentage >= 30:
+            gaze_stability = "Fair"
+        else:
+            gaze_stability = "Needs Improvement"
+
+        feedback = self.eye_tracker.generate_coaching_feedback(
+            eye_contact_percentage, looking_away_count, gaze_stability
+        )
+
+        return {
+            "eye_contact_percentage": eye_contact_percentage,
+            "looking_away_count": looking_away_count,
+            "gaze_stability": gaze_stability,
+            "coaching_feedback": feedback
+        }
+
+    def _compute_drowsiness_results(self, ear_values, frames_eyes_closed,
+                                     total_eye_frames, blink_count, yawn_count,
+                                     mar_values, video_duration):
+        """Compute drowsiness results using DrowsinessDetector's scoring methods."""
+        if total_eye_frames == 0:
+            return self.drowsiness_detector._error_result("No faces detected for drowsiness analysis")
+
+        perclos = round((frames_eyes_closed / total_eye_frames) * 100, 1)
+        avg_ear = round(np.mean(ear_values), 3) if ear_values else 0.25
+        blink_rate = round((blink_count / video_duration) * 60, 1) if video_duration > 0 else 0
+
+        alertness_score = self.drowsiness_detector._calculate_alertness_score(
+            perclos, yawn_count, blink_rate, avg_ear
+        )
+        drowsiness_level = self.drowsiness_detector._get_drowsiness_level(alertness_score)
+        feedback = self.drowsiness_detector._generate_feedback(
+            alertness_score, drowsiness_level, yawn_count, blink_rate, perclos
+        )
+
+        return {
+            "alertness_score": alertness_score,
+            "drowsiness_level": drowsiness_level,
+            "yawn_count": yawn_count,
+            "blink_rate": blink_rate,
+            "perclos": perclos,
+            "avg_ear": avg_ear,
+            "coaching_feedback": feedback
+        }
+
+    def analyze_video_with_eye_tracking(self, video_path):
+        """
+        Comprehensive analysis: emotions + eye tracking + drowsiness.
+        Returns combined results. Uses single-pass pipeline with 3-pass fallback.
+        """
+        print("🎯 Running comprehensive analysis (Emotions + Eye Tracking + Drowsiness)...")
+
+        # Try single-pass pipeline first
+        try:
+            result = self.analyze_video_single_pass(video_path)
+            if result is not None:
+                print("✅ Single-pass analysis succeeded.")
+                return result
+        except Exception as e:
+            print(f"⚠️ Single-pass analysis failed: {e}. Falling back to 3-pass approach.")
+
+        # Fall back to original 3-pass approach
+        print("🔄 Using 3-pass fallback analysis...")
+        emotion_results = self.analyze_video(video_path)
+        eye_tracking_results = self.eye_tracker.analyze_video(video_path)
+        drowsiness_results = self.drowsiness_detector.analyze_video(video_path)
+
+        return {
+            "emotion_analysis": emotion_results,
+            "eye_tracking": eye_tracking_results,
+            "drowsiness": drowsiness_results
+        }
+
+
+================================================================================
+File: backend\emotion_recognition\model.py
+================================================================================
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv2D, SeparableConv2D, MaxPooling2D, BatchNormalization, Activation, GlobalAveragePooling2D, Add, Dense, Dropout
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.losses import CategoricalCrossentropy
+
+def create_emotion_model(input_shape=(48, 48, 1), num_classes=7):
+    """
+    Creates a Mini-Xception model for facial expression recognition.
+    This architecture is lighter than VGG16 but very effective for FER-2013 (targeting ~66-70%+).
+    """
+    regularization = l2(0.01)
+    
+    # Input
+    img_input = Input(input_shape)
+    
+    # Block 1 - Entry Flow
+    x = Conv2D(8, (3, 3), strides=(1, 1), kernel_regularizer=regularization, use_bias=False)(img_input)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    x = Conv2D(8, (3, 3), strides=(1, 1), kernel_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Module 1 (Residual)
+    processed = Conv2D(16, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+    
+    x = SeparableConv2D(16, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(16, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+    
+    x = Add()([x, processed])
+    
+    # Module 2 (Residual)
+    processed = Conv2D(32, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+    
+    x = SeparableConv2D(32, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(32, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+    
+    x = Add()([x, processed])
+    
+    # Module 3 (Residual)
+    processed = Conv2D(64, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+    
+    x = SeparableConv2D(64, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(64, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+    
+    x = Add()([x, processed])
+    
+    # Module 4 (Residual)
+    processed = Conv2D(128, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+    
+    x = SeparableConv2D(128, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(128, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+    
+    x = Add()([x, processed])
+    
+    # Global Average Pooling & Output
+    x = Conv2D(num_classes, (3, 3), padding='same')(x)
+    x = GlobalAveragePooling2D()(x)
+    output = Activation('softmax', name='predictions')(x)
+    
+    model = Model(img_input, output)
+    
+    model.compile(
+        optimizer='adam',
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+
+def create_emotion_model_v2(input_shape=(48, 48, 1), num_classes=7):
+    """
+    V2 Mini-Xception model with wider filters, dropout regularization,
+    dense classification head, and label smoothing. Targets ~70-73%+ on FER-2013.
+    """
+    regularization = l2(0.001)
+
+    # Input
+    img_input = Input(input_shape)
+
+    # Block 1 - Entry Flow
+    x = Conv2D(32, (3, 3), strides=(1, 1), kernel_regularizer=regularization, use_bias=False)(img_input)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(32, (3, 3), strides=(1, 1), kernel_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    # Module 1 (Residual) - 64 filters
+    processed = Conv2D(64, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+
+    x = SeparableConv2D(64, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(64, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+
+    x = Add()([x, processed])
+    x = Dropout(0.25)(x)
+
+    # Module 2 (Residual) - 128 filters
+    processed = Conv2D(128, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+
+    x = SeparableConv2D(128, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(128, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+
+    x = Add()([x, processed])
+    x = Dropout(0.25)(x)
+
+    # Module 3 (Residual) - 256 filters
+    processed = Conv2D(256, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+
+    x = SeparableConv2D(256, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(256, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+
+    x = Add()([x, processed])
+    x = Dropout(0.25)(x)
+
+    # Module 4 (Residual) - 256 filters
+    processed = Conv2D(256, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    processed = BatchNormalization()(processed)
+
+    x = SeparableConv2D(256, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(256, (3, 3), padding='same', pointwise_regularizer=regularization, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+
+    x = Add()([x, processed])
+    x = Dropout(0.25)(x)
+
+    # Dense classification head (replaces Conv2D→GAP→softmax)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output = Dense(num_classes, activation='softmax', name='predictions')(x)
+
+    model = Model(img_input, output)
+
+    model.compile(
+        optimizer='adam',
+        loss=CategoricalCrossentropy(label_smoothing=0.1),
+        metrics=['accuracy']
+    )
+
+    return model
+
+
+================================================================================
+File: backend\emotion_recognition\__init__.py
+================================================================================
+
+
+
+================================================================================
+File: frontend\package.json
+================================================================================
+
+{
+  "name": "frontend",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "axios": "^1.6.0",
+    "react-media-recorder": "^1.6.6"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^4.3.2"
+  }
+}
+
+
+================================================================================
+File: frontend\frontend\eslint.config.js
+================================================================================
+
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+      parserOptions: {
+        ecmaVersion: 'latest',
+        ecmaFeatures: { jsx: true },
+        sourceType: 'module',
+      },
+    },
+    rules: {
+      'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
+    },
+  },
+])
+
+
+================================================================================
+File: frontend\frontend\index.html
+================================================================================
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>frontend</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+================================================================================
+File: frontend\frontend\package.json
+================================================================================
+
+{
+  "name": "interview-coach-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-media-recorder": "^1.7.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "eslint": "^8.38.0",
+    "eslint-plugin-react": "^7.32.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.3.4",
+    "vite": "^4.3.2"
+  }
+}
+
+
+================================================================================
+File: frontend\frontend\vite.config.js
+================================================================================
+
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+
+
+================================================================================
+File: frontend\frontend\src\App.css
+================================================================================
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background: #0a0a0f;
+  color: #fff;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ===== NAVBAR ===== */
+.navbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 40px;
+  background: rgba(10, 10, 15, 0.95);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  backdrop-filter: blur(20px);
+}
+
+.navbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.3px;
+}
+
+.navbar-brand .brand-icon {
+  width: 32px;
+  height: 32px;
+  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+}
+
+.navbar-badge {
+  font-size: 0.82rem;
+  color: #888;
+  font-weight: 400;
+}
+
+/* ===== MAIN CONTAINER ===== */
+.container {
+  width: 100%;
+  min-height: calc(100vh - 61px);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ===== SETUP / HERO SCREEN ===== */
+.hero-section {
+  text-align: center;
+  padding: 70px 20px 40px;
+}
+
+.hero-section h1 {
+  font-size: clamp(2.8rem, 6vw, 4.2rem);
+  font-weight: 800;
+  letter-spacing: -1.5px;
+  line-height: 1.1;
+  color: #fff;
+  margin-bottom: 18px;
+}
+
+.hero-subtitle {
+  font-size: 1.05rem;
+  color: #888;
+  max-width: 500px;
+  margin: 0 auto 50px;
+  line-height: 1.7;
+  font-weight: 400;
+}
+
+/* ===== CONFIGURE SESSION CARD ===== */
+.session-card {
+  background: #111118;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  padding: 36px 40px;
+  max-width: 720px;
+  margin: 0 auto;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.session-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 28px;
+}
+
+.session-card-header .header-icon {
+  width: 28px;
+  height: 28px;
+  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.9rem;
+}
+
+.session-card-header h2 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.3px;
+}
+
+.session-card-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  align-items: center;
+}
+
+/* ===== FORM ELEMENTS ===== */
+.form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.form-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: #3b82f6;
+  text-transform: uppercase;
+}
+
+input[type="text"] {
+  background: #1a1a25;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-radius: 10px;
+  padding: 13px 16px;
+  width: 100%;
+  font-size: 0.95rem;
+  font-family: 'Inter', sans-serif;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  outline: none;
+}
+
+input[type="text"]::placeholder {
+  color: #555;
+}
+
+input[type="text"]:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+
+.file-upload-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #1a1a25;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  padding: 11px 16px;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.file-upload-wrapper:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+input[type="file"] {
+  display: none;
+}
+
+.file-label {
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  color: #ccc;
+  padding: 5px 14px;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.file-name {
+  font-size: 0.85rem;
+  color: #666;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== BEGIN BUTTON SECTION ===== */
+.action-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: #1a1a25;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 14px;
+  padding: 28px 24px;
+  text-align: center;
+}
+
+.action-section p {
+  font-size: 0.85rem;
+  color: #666;
+  line-height: 1.6;
+}
+
+.begin-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 10px;
+  padding: 13px 28px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  width: 100%;
+  transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+  font-family: 'Inter', sans-serif;
+  letter-spacing: -0.2px;
+}
+
+.begin-btn:hover {
+  background: #2563eb;
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px rgba(59, 130, 246, 0.35);
+}
+
+.begin-btn:active {
+  transform: translateY(0);
+}
+
+.begin-btn:disabled {
+  background: #1e3a5f;
+  color: #555;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* ===== INTERVIEW SCREEN ===== */
+.interview-wrapper {
+  padding: 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  flex: 1;
+}
+
+.interview-layout {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+  align-items: flex-start;
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* ===== LEFT PANEL ===== */
+.left-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.current-question-display {
+  background: #111118;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  border-left: 3px solid #3b82f6;
+  padding: 16px 20px;
+  border-radius: 12px;
+}
+
+.current-question-display small {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  color: #3b82f6;
+  text-transform: uppercase;
+}
+
+.current-question-display h2 {
+  margin-top: 6px;
+  font-size: 1.15rem;
+  color: #e0e0e0;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+/* VIDEO BOX */
+.video-box {
+  background: #080810;
+  width: 100%;
+  height: 380px;
+  border-radius: 14px;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.placeholder-text {
+  color: #444;
+  font-size: 0.95rem;
+}
+
+.live-preview {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.rec-dot {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  background: #ef4444;
+  color: white;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-weight: 700;
+  font-size: 0.75rem;
+  z-index: 10;
+  animation: pulse 1.5s infinite;
+}
+
+/* CONTROLS */
+.controls {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.start-btn {
+  background: #3b82f6;
+  color: white;
+  border: none;
+  padding: 12px 28px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s;
+  font-family: 'Inter', sans-serif;
+}
+
+.start-btn:hover {
+  background: #2563eb;
+  transform: translateY(-1px);
+}
+
+.stop-btn {
+  background: #ef4444;
+  color: white;
+  border: none;
+  padding: 12px 28px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+  font-family: 'Inter', sans-serif;
+}
+
+.stop-btn:hover {
+  background: #dc2626;
+}
+
+.loading-text {
+  text-align: center;
+  color: #3b82f6;
+  font-style: italic;
+  font-size: 0.9rem;
+  padding: 12px;
+  animation: pulse 1.5s infinite;
+}
+
+/* ===== RIGHT PANEL ===== */
+.right-panel {
+  background: #111118;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 14px;
+  padding: 20px;
+  max-height: 82vh;
+  overflow-y: auto;
+}
+
+.right-panel h3 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: #555;
+  margin-bottom: 14px;
+}
+
+.right-panel::-webkit-scrollbar {
+  width: 4px;
+}
+
+.right-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.right-panel::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 2px;
+}
+
+.questions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-item {
+  background: #1a1a25;
+  padding: 13px 15px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.18s;
+  border-left: 3px solid transparent;
+}
+
+.question-item:hover {
+  background: #1e1e2e;
+  border-left-color: #3b82f6;
+}
+
+.question-item.active {
+  background: rgba(59, 130, 246, 0.1);
+  border-left: 3px solid #3b82f6;
+}
+
+.question-item h4 {
+  margin: 0;
+  font-size: 0.88rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: #ccc;
+}
+
+.question-item.active h4 {
+  color: #fff;
+}
+
+.question-item.resume-q {
+  border-left: 3px solid #60a5fa;
+}
+
+.question-item.resume-q.active {
+  background: rgba(96, 165, 250, 0.1);
+}
+
+/* Resume Questions Section */
+.resume-questions-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.resume-questions-section h3 {
+  color: #60a5fa;
+  margin-bottom: 5px;
+}
+
+.resume-q-hint {
+  font-size: 0.75rem;
+  color: #555;
+  margin: 0 0 10px;
+  font-style: italic;
+}
+
+.loading-resume-q {
+  color: #3b82f6;
+  font-size: 0.82rem;
+  animation: pulse 1.5s infinite;
+}
+
+/* ===== RESULTS ===== */
+.results {
+  background: #111118;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  padding: 22px;
+  border-radius: 14px;
+  margin-top: 16px;
+}
+
+.score-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.score-header h2,
+.score-header h3 {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.speak-btn {
+  background: transparent;
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  color: #3b82f6;
+  font-size: 0.82rem;
+  padding: 6px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+  transition: all 0.2s;
+}
+
+.speak-btn:hover {
+  background: #3b82f6;
+  color: white;
+}
+
+.improvement-box {
+  background: rgba(251, 191, 36, 0.07);
+  padding: 14px;
+  border-radius: 10px;
+  margin-top: 12px;
+  color: #fbbf24;
+  border-left: 3px solid #fbbf24;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.follow-up-btn {
+  margin-top: 14px;
+  background: #1d4ed8;
+  color: white;
+  width: 100%;
+  text-align: left;
+  font-size: 0.88rem;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: none;
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+  transition: background 0.2s;
+}
+
+.follow-up-btn:hover {
+  background: #1e40af;
+}
+
+/* ===== EMOTION BOX ===== */
+.emotion-box {
+  margin-top: 16px;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.emotion-badge {
+  background: #ef4444;
+  color: white;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.emotion-feedback p {
+  margin: 8px 0;
+  color: #bbb;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.emotion-breakdown {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.emotion-breakdown small {
+  color: #666;
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.78rem;
+}
+
+.graph-container {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 5px;
+}
+
+.graph-bar {
+  background: linear-gradient(90deg, #ef4444, #f87171);
+  color: white;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  min-width: 30px;
+}
+
+/* ===== EYE TRACKING BOX ===== */
+.eye-tracking-box {
+  margin-top: 16px;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.eye-badge {
+  background: #3b82f6;
+  color: white;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.eye-metrics,
+.drowsiness-metrics {
+  display: flex;
+  gap: 10px;
+  margin: 14px 0;
+  flex-wrap: wrap;
+}
+
+.metric-item {
+  flex: 1;
+  min-width: 130px;
+  background: #1a1a25;
+  padding: 12px;
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metric-label {
+  color: #666;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.metric-value {
+  color: #3b82f6;
+  font-weight: 700;
+  font-size: 1.15rem;
+}
+
+.drowsiness-value {
+  color: #fb923c !important;
+}
+
+.eye-feedback p,
+.drowsiness-feedback p {
+  margin: 8px 0;
+  color: #bbb;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.eye-contact-bar {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.eye-contact-bar small {
+  color: #666;
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.78rem;
+}
+
+.progress-bar-container {
+  width: 100%;
+  height: 24px;
+  background: #1a1a25;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: 700;
+  font-size: 0.8rem;
+  transition: width 0.5s ease;
+  border-radius: 12px;
+}
+
+/* ===== DROWSINESS BOX ===== */
+.drowsiness-box {
+  margin-top: 16px;
+  border: 1px solid rgba(251, 146, 60, 0.2);
+}
+
+.drowsiness-badge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.badge-alert {
+  background: #16a34a;
+  color: white;
+}
+
+.badge-mild {
+  background: #ca8a04;
+  color: white;
+}
+
+.badge-moderate {
+  background: #ea580c;
+  color: white;
+}
+
+.badge-severe {
+  background: #dc2626;
+  color: white;
+}
+
+/* ===== ANIMATIONS ===== */
+.fade-in {
+  animation: fadeIn 0.4s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #222;
+  border-radius: 3px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   BOOTCAMP — HOME MODE CARDS
+═══════════════════════════════════════════════════════ */
+.home-mode-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.mode-card {
+  background: #111118;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  padding: 36px 32px;
+  cursor: pointer;
+  transition: all 0.22s ease;
+  text-align: left;
+  position: relative;
+  overflow: hidden;
+}
+
+.mode-card:hover {
+  border-color: rgba(59, 130, 246, 0.4);
+  transform: translateY(-3px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+}
+
+.mode-card-featured {
+  border-color: rgba(59, 130, 246, 0.25);
+  background: linear-gradient(145deg, #111118, #0d1a2e);
+}
+
+.mode-card-featured:hover {
+  border-color: rgba(59, 130, 246, 0.6);
+  box-shadow: 0 12px 40px rgba(59, 130, 246, 0.18);
+}
+
+.mode-card-badge {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: #3b82f6;
+  color: white;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 20px;
+  letter-spacing: 1px;
+}
+
+.mode-card-icon {
+  font-size: 2.2rem;
+  margin-bottom: 16px;
+}
+
+.mode-card h3 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: #fff;
+}
+
+.mode-card p {
+  font-size: 0.88rem;
+  color: #666;
+  line-height: 1.6;
+  margin-bottom: 20px;
+}
+
+.mode-card-btn {
+  font-size: 0.85rem;
+  color: #555;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+.mode-card:hover .mode-card-btn {
+  color: #3b82f6;
+}
+
+.featured-btn {
+  color: #3b82f6 !important;
+}
+
+/* ═══════════════════════════════════════════════════════
+   BOOTCAMP — SETUP PAGE
+═══════════════════════════════════════════════════════ */
+.bootcamp-card {
+  max-width: 640px;
+}
+
+.bootcamp-form {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  text-align: left;
+}
+
+/* Days Slider */
+.days-slider-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.days-display {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.days-number {
+  font-size: 2.5rem;
+  font-weight: 800;
+  color: #3b82f6;
+  line-height: 1;
+}
+
+.days-label {
+  font-size: 1rem;
+  color: #555;
+}
+
+.days-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  background: #1a1a25;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.days-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #3b82f6;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.5);
+}
+
+.slider-ticks {
+  display: flex;
+  justify-content: space-between;
+}
+
+.tick {
+  font-size: 0.78rem;
+  color: #444;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.2s;
+}
+
+.tick-active {
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+.days-description {
+  font-size: 0.82rem;
+  color: #555;
+  margin: 0;
+  font-style: italic;
+}
+
+/* Day Preview Strip */
+.day-preview-strip {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.day-preview-item {
+  flex: 1;
+  min-width: 80px;
+  background: #1a1a25;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  padding: 10px 8px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.day-preview-icon {
+  font-size: 1.2rem;
+}
+
+.day-preview-label {
+  font-size: 0.7rem;
+  color: #3b82f6;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.day-preview-title {
+  font-size: 0.72rem;
+  color: #666;
+  line-height: 1.3;
+}
+
+/* Bootcamp actions */
+.bootcamp-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.back-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #888;
+  padding: 10px 18px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 0.88rem;
+  font-family: 'Inter', sans-serif;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.back-btn:hover {
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #ccc;
+}
+
+.bootcamp-generate-btn {
+  flex: 1;
+}
+
+.bootcamp-error {
+  color: #ef4444;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+/* Spinner */
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+  margin-right: 6px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   BOOTCAMP — ROADMAP PAGE
+═══════════════════════════════════════════════════════ */
+.bootcamp-roadmap-page {
+  padding: 28px 40px;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.roadmap-header {
+  margin-bottom: 36px;
+}
+
+.roadmap-title-block {
+  margin: 12px 0 18px;
+}
+
+.roadmap-title-block h1 {
+  font-size: 2rem;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+}
+
+.roadmap-progress-bar {
+  width: 100%;
+  height: 4px;
+  background: #1a1a25;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.roadmap-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+/* Timeline */
+.roadmap-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.roadmap-day-card {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 20px 24px;
+  background: #111118;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 14px;
+  margin-bottom: 12px;
+  position: relative;
+  transition: all 0.2s;
+}
+
+.roadmap-day-card.day-current {
+  border-color: rgba(59, 130, 246, 0.35);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.15);
+}
+
+.roadmap-day-card.day-done {
+  opacity: 0.75;
+}
+
+.roadmap-day-card.day-locked {
+  opacity: 0.45;
+}
+
+/* Status circle */
+.day-status-circle {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.3rem;
+  flex-shrink: 0;
+}
+
+.circle-done {
+  background: rgba(22, 163, 74, 0.2);
+  border: 2px solid #16a34a;
+  color: #16a34a;
+  font-weight: 700;
+}
+
+.circle-current {
+  background: rgba(59, 130, 246, 0.15);
+  border: 2px solid #3b82f6;
+}
+
+.circle-locked {
+  background: #1a1a25;
+  border: 2px solid #2a2a35;
+}
+
+/* Day info */
+.day-info {
+  flex: 1;
+}
+
+.day-info-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.day-number-tag {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #555;
+}
+
+.day-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 20px;
+}
+
+.done-badge {
+  background: rgba(22, 163, 74, 0.15);
+  color: #16a34a;
+}
+
+.current-badge {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3b82f6;
+}
+
+.locked-badge {
+  background: #1a1a25;
+  color: #444;
+}
+
+.day-card-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0 0 4px;
+  color: #eee;
+}
+
+.day-card-focus {
+  font-size: 0.85rem;
+  color: #666;
+  margin: 0 0 4px;
+  line-height: 1.5;
+}
+
+.day-card-questions {
+  font-size: 0.75rem;
+  color: #444;
+  margin: 0;
+}
+
+/* Action buttons */
+.day-action {
+  flex-shrink: 0;
+}
+
+.day-action-btn {
+  padding: 10px 20px;
+  border-radius: 10px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  font-family: 'Inter', sans-serif;
+  transition: all 0.18s;
+}
+
+.start-day-btn {
+  background: #3b82f6;
+  color: white;
+}
+
+.start-day-btn:hover {
+  background: #2563eb;
+  transform: translateY(-1px);
+}
+
+.retry-btn {
+  background: #1a1a25;
+  color: #888;
+  border: 1px solid #2a2a35;
+}
+
+.retry-btn:hover {
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+
+.locked-btn {
+  background: #1a1a25;
+  color: #333;
+  cursor: not-allowed;
+}
+
+/* Bootcamp Complete Banner */
+.bootcamp-complete-banner {
+  margin-top: 32px;
+  background: linear-gradient(135deg, rgba(22, 163, 74, 0.12), rgba(59, 130, 246, 0.08));
+  border: 1px solid rgba(22, 163, 74, 0.3);
+  border-radius: 18px;
+  padding: 36px;
+  text-align: center;
+}
+
+.bootcamp-complete-banner h2 {
+  font-size: 1.8rem;
+  margin-bottom: 10px;
+}
+
+.bootcamp-complete-banner p {
+  color: #888;
+  margin-bottom: 24px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   BOOTCAMP — DAY PRACTICE PAGE
+═══════════════════════════════════════════════════════ */
+.bootcamp-day-page {
+  padding: 0;
+}
+
+.day-page-header {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 20px 32px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-wrap: wrap;
+}
+
+.day-page-title {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+}
+
+.day-big-icon {
+  font-size: 2rem;
+}
+
+.day-page-title h2 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin: 0 0 2px;
+}
+
+.day-page-title p {
+  font-size: 0.82rem;
+  color: #666;
+  margin: 0;
+}
+
+/* Question progress dots */
+.question-progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.q-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  transition: all 0.2s;
+}
+
+.q-dot-done {
+  background: #16a34a;
+}
+
+.q-dot-current {
+  background: #3b82f6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
+}
+
+.q-dot-pending {
+  background: #2a2a35;
+}
+
+.q-progress-text {
+  font-size: 0.78rem;
+  color: #555;
+  margin-left: 4px;
+}
+
+/* Day practice layout */
+.day-practice-layout {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+  padding: 20px 32px 32px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* Day tip box */
+.day-tip-box {
+  margin-top: 20px;
+  background: rgba(59, 130, 246, 0.06);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.day-tip-box h4 {
+  font-size: 0.85rem;
+  color: #3b82f6;
+  margin-bottom: 8px;
+}
+
+.day-tip-box p {
+  font-size: 0.83rem;
+  color: #777;
+  line-height: 1.6;
+  margin: 0;
+}
+
+/* Question answered style */
+.question-answered {
+  opacity: 0.5;
+}
+
+.question-answered h4 {
+  text-decoration: line-through;
+  color: #555 !important;
+}
+
+/* Day navigation actions */
+.day-nav-actions {
+  margin-top: 16px;
+  display: flex;
+  gap: 12px;
+}
+
+.complete-day-btn {
+  background: #16a34a !important;
+}
+
+.complete-day-btn:hover {
+  background: #15803d !important;
+}
+
+================================================================================
+File: frontend\frontend\src\App.jsx
+================================================================================
+
+import { useState } from "react";
+import "./App.css";
+import PracticeSession from "./PracticeSession";
+import BootcampSetup from "./BootcampSetup";
+import BootcampRoadmap from "./BootcampRoadmap";
+import BootcampDay from "./BootcampDay";
+
+const App = () => {
+  // mode: 'home' | 'practice' | 'bootcamp-setup' | 'bootcamp-roadmap' | 'bootcamp-day'
+  const [mode, setMode] = useState("home");
+
+  // Bootcamp state
+  const [bootcampPlan, setBootcampPlan] = useState(null);
+  const [bootcampRole, setBootcampRole] = useState("");
+  const [bootcampResumeQuestions, setBootcampResumeQuestions] = useState([]);
+  const [completedDays, setCompletedDays] = useState([]);
+  const [activeDay, setActiveDay] = useState(null);
+
+  const handlePlanGenerated = (plan, role, resumeQs = []) => {
+    setBootcampPlan(plan);
+    setBootcampRole(role);
+    setBootcampResumeQuestions(resumeQs);
+    setCompletedDays([]);
+    setMode("bootcamp-roadmap");
+  };
+
+  const handleStartDay = (dayItem) => {
+    setActiveDay(dayItem);
+    setMode("bootcamp-day");
+  };
+
+  const handleDayComplete = () => {
+    setCompletedDays(prev => [...new Set([...prev, activeDay.day])]);
+    setActiveDay(null);
+    setMode("bootcamp-roadmap");
+  };
+
+  const goHome = () => {
+    setMode("home");
+    setBootcampPlan(null);
+    setBootcampResumeQuestions([]);
+    setCompletedDays([]);
+    setActiveDay(null);
+  };
+
+  return (
+    <>
+      {/* NAVBAR */}
+      <nav className="navbar">
+        <div className="navbar-brand">
+          <div className="brand-icon">🎯</div>
+          MockMate AI
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {mode !== "home" && (
+            <button
+              className="back-btn"
+              style={{ padding: "6px 14px", fontSize: "0.82rem" }}
+              onClick={goHome}
+            >
+              Home
+            </button>
+          )}
+          <span className="navbar-badge">Interview Coach v1.0</span>
+        </div>
+      </nav>
+
+      <div className="container">
+
+        {/* HOME */}
+        {mode === "home" && (
+          <div className="hero-section">
+            <h1>Master Your Interview</h1>
+            <p className="hero-subtitle">
+              Practice with our AI-powered coach. Get real-time feedback on your
+              tone, confidence, and answers.
+            </p>
+            <div className="home-mode-cards">
+              <div className="mode-card" onClick={() => setMode("practice")}>
+                <div className="mode-card-icon">🎙️</div>
+                <h3>Single Practice Session</h3>
+                <p>Jump straight into a practice interview. Get AI feedback on any question instantly.</p>
+                <span className="mode-card-btn">Start Session →</span>
+              </div>
+              <div className="mode-card mode-card-featured" onClick={() => setMode("bootcamp-setup")}>
+                <div className="mode-card-icon">🚀</div>
+                <h3>AI Interview Bootcamp</h3>
+                <p>Get a personalized 1–5 day roadmap. Structured prep with daily goals and unlock system.</p>
+                <span className="mode-card-btn featured-btn">Start Bootcamp →</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* PRACTICE — hook only mounts here */}
+        {mode === "practice" && (
+          <PracticeSession onBack={goHome} />
+        )}
+
+        {/* BOOTCAMP SETUP */}
+        {mode === "bootcamp-setup" && (
+          <BootcampSetup
+            onPlanGenerated={handlePlanGenerated}
+            onBack={() => setMode("home")}
+          />
+        )}
+
+        {/* BOOTCAMP ROADMAP */}
+        {mode === "bootcamp-roadmap" && bootcampPlan && (
+          <BootcampRoadmap
+            plan={bootcampPlan}
+            completedDays={completedDays}
+            onStartDay={handleStartDay}
+            onBack={() => { setBootcampPlan(null); setMode("home"); }}
+          />
+        )}
+
+        {/* BOOTCAMP DAY */}
+        {mode === "bootcamp-day" && activeDay && (
+          <BootcampDay
+            dayItem={activeDay}
+            jobRole={bootcampRole}
+            resumeQuestions={bootcampResumeQuestions}
+            onDayComplete={handleDayComplete}
+            onBack={() => setMode("bootcamp-roadmap")}
+          />
+        )}
+
+      </div>
+    </>
+  );
+};
+
+export default App;
+
+================================================================================
+File: frontend\frontend\src\BootcampDay.jsx
+================================================================================
+
+import { useState, useRef, useEffect } from "react";
+import { useReactMediaRecorder } from "react-media-recorder";
+import axios from "axios";
+
+const VideoPreview = ({ stream }) => {
+    const videoRef = useRef(null);
+    useEffect(() => {
+        if (videoRef.current && stream) videoRef.current.srcObject = stream;
+    }, [stream]);
+    if (!stream) return null;
+    return <video ref={videoRef} autoPlay muted />;
+};
+
+const BootcampDay = ({ dayItem, jobRole, resumeQuestions = [], onDayComplete, onBack }) => {
+    const [currentQIndex, setCurrentQIndex] = useState(0);
+    const [activeResumeQuestion, setActiveResumeQuestion] = useState(null); // Track if a resume question is selected
+    const [analysis, setAnalysis] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [answeredCount, setAnsweredCount] = useState(0);
+
+    const questions = dayItem.questions;
+    // Current question is either the selected resume question, or the bootcamp day question
+    const currentQuestion = activeResumeQuestion || questions[currentQIndex];
+
+    const handleOnStop = async (blobUrl, blob) => {
+        setLoading(true);
+        setAnalysis(null);
+        window.speechSynthesis.cancel();
+
+        try {
+            const videoFile = new File([blob], `bootcamp_day${dayItem.day}.webm`, {
+                type: "video/webm",
+            });
+            const formData = new FormData();
+            formData.append("file", videoFile);
+            formData.append("question", currentQuestion);
+            formData.append("day", dayItem.day);
+            formData.append("job_role", jobRole);
+
+            const response = await axios.post(
+                "http://127.0.0.1:8000/process_bootcamp_answer",
+                formData,
+                { headers: { "Content-Type": "multipart/form-data" } }
+            );
+
+            if (response.data.status === "error") {
+                alert(`❌ ${response.data.message}`);
+                return;
+            }
+
+            setAnalysis(response.data.ai_analysis);
+            setAnsweredCount((prev) => prev + 1);
+        } catch (err) {
+            console.error(err);
+            alert("Error processing video. Check backend logs.");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const { status, startRecording, stopRecording, mediaBlobUrl, previewStream } =
+        useReactMediaRecorder({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: true,
+            blobPropertyBag: { type: "video/webm" },
+            onStop: handleOnStop,
+        });
+
+    const speakText = (text) => {
+        window.speechSynthesis.cancel();
+        if (isSpeaking) {
+            setIsSpeaking(false);
+            return;
+        }
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.onend = () => setIsSpeaking(false);
+        window.speechSynthesis.speak(utterance);
+        setIsSpeaking(true);
+    };
+
+    const goNextQuestion = () => {
+        setAnalysis(null);
+        setActiveResumeQuestion(null); // Clear resume question if active
+        // Only increment index if we aren't at the end of bootcamp questions
+        if (currentQIndex < questions.length - 1) {
+            setCurrentQIndex((prev) => prev + 1);
+        }
+        window.speechSynthesis.cancel();
+    };
+
+    const dayIcons = ["💬", "🧠", "🛠️", "⚙️", "🎯"];
+
+    return (
+        <div className="bootcamp-day-page">
+            {/* Day Header */}
+            <div className="day-page-header">
+                <button className="back-btn" onClick={onBack}>
+                    ← Roadmap
+                </button>
+                <div className="day-page-title">
+                    <span className="day-big-icon">{dayIcons[dayItem.day - 1]}</span>
+                    <div>
+                        <h2>Day {dayItem.day}: {dayItem.title}</h2>
+                        <p>{dayItem.focus}</p>
+                    </div>
+                </div>
+                {/* Question progress */}
+                <div className="question-progress">
+                    {questions.map((_, i) => (
+                        <div
+                            key={i}
+                            className={`q-dot ${i < currentQIndex ? "q-dot-done" : i === currentQIndex ? "q-dot-current" : "q-dot-pending"}`}
+                        />
+                    ))}
+                    <span className="q-progress-text">
+                        {currentQIndex + 1}/{questions.length}
+                    </span>
+                </div>
+            </div>
+
+            <div className="day-practice-layout">
+                {/* LEFT: Video + controls */}
+                <div className="left-panel">
+                    <div className="current-question-display">
+                        <small>{activeResumeQuestion ? "Resume-Based Topic" : `Question ${currentQIndex + 1} of ${questions.length}`}</small>
+                        <h2>"{currentQuestion}"</h2>
+                    </div>
+
+                    <div className="video-box">
+                        {status === "idle" && (
+                            <div className="placeholder-text">Ready? Press Start below.</div>
+                        )}
+                        {status === "recording" && (
+                            <div className="live-preview">
+                                <div className="rec-dot">🔴 REC</div>
+                                <VideoPreview stream={previewStream} />
+                            </div>
+                        )}
+                        {status === "stopped" && mediaBlobUrl && !loading && (
+                            <video src={mediaBlobUrl} controls autoPlay />
+                        )}
+                    </div>
+
+                    <div className="controls">
+                        {status !== "recording" && !loading && (
+                            <button onClick={startRecording} className="start-btn">
+                                🔴 Start Answer
+                            </button>
+                        )}
+                        {status === "recording" && (
+                            <button onClick={stopRecording} className="stop-btn">
+                                ⏹ Stop & Submit
+                            </button>
+                        )}
+                    </div>
+
+                    {loading && (
+                        <div className="loading-text">
+                            🧠 AI is analyzing your Day {dayItem.day} answer...
+                        </div>
+                    )}
+
+                    {/* AI FEEDBACK */}
+                    {analysis && (
+                        <div className="results fade-in">
+                            <div className="score-header">
+                                <h2>Score: {analysis.rating}/100</h2>
+                                <button
+                                    className="speak-btn"
+                                    onClick={() =>
+                                        speakText(`You scored ${analysis.rating}. ${analysis.feedback}`)
+                                    }
+                                >
+                                    {isSpeaking ? "⏹️ Stop" : "🔊 Listen"}
+                                </button>
+                            </div>
+                            <p>
+                                <strong>💡 Feedback:</strong> {analysis.feedback}
+                            </p>
+                            <div className="improvement-box">
+                                <p>
+                                    <strong>✨ Better Answer:</strong> "{analysis.improved_answer}"
+                                </p>
+                            </div>
+
+                            {/* Navigation */}
+                            <div className="day-nav-actions">
+                                {currentQIndex < questions.length - 1 || activeResumeQuestion ? (
+                                    <button className="begin-btn" onClick={goNextQuestion}>
+                                        {activeResumeQuestion ? "Return to Bootcamp Questions →" : "Next Question →"}
+                                    </button>
+                                ) : (
+                                    <button
+                                        className="begin-btn complete-day-btn"
+                                        onClick={onDayComplete}
+                                    >
+                                        ✅ Mark Day {dayItem.day} Complete
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* RIGHT: Questions sidebar */}
+                <div className="right-panel">
+                    <h3>📋 Day {dayItem.day} Questions</h3>
+                    <div className="questions-list">
+                        {questions.map((q, i) => (
+                            <div
+                                key={i}
+                                className={`question-item ${i === currentQIndex && !activeResumeQuestion ? "active" : ""} ${i < currentQIndex ? "question-answered" : ""}`}
+                                onClick={() => { setActiveResumeQuestion(null); setCurrentQIndex(i); setAnalysis(null); window.speechSynthesis.cancel(); }}
+                                style={{ cursor: "pointer" }}
+                            >
+                                <h4>
+                                    {i < currentQIndex ? "✅" : i === currentQIndex && !activeResumeQuestion ? "▶" : `${i + 1}.`}{" "}
+                                    {q}
+                                </h4>
+                            </div>
+                        ))}
+                    </div>
+
+                    {resumeQuestions.length > 0 && (
+                        <div className="resume-questions-section" style={{ marginTop: "24px" }}>
+                            <h3>📄 Resume-Based Questions</h3>
+                            <p className="resume-q-hint">Optional: Tailored to your resume</p>
+                            <div className="questions-list">
+                                {resumeQuestions.map((q, i) => (
+                                    <div
+                                        key={`resume-${i}`}
+                                        className={`question-item resume-q ${activeResumeQuestion === q ? 'active' : ''}`}
+                                        onClick={() => { setActiveResumeQuestion(q); setAnalysis(null); window.speechSynthesis.cancel(); }}
+                                        style={{ cursor: "pointer", borderLeft: activeResumeQuestion === q ? "3px solid #60a5fa" : "3px solid transparent" }}
+                                    >
+                                        <h4>{i + 1}. {q}</h4>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="day-tip-box">
+                        <h4>💡 Day {dayItem.day} Tip</h4>
+                        <p>
+                            {dayItem.day === 1 &&
+                                "Use the STAR method: Situation, Task, Action, Result for behavioral questions."}
+                            {dayItem.day === 2 &&
+                                "Explain concepts clearly — interviewers test depth of understanding, not memorization."}
+                            {dayItem.day === 3 &&
+                                "Think out loud. Interviewers value your reasoning process, not just the answer."}
+                            {dayItem.day === 4 &&
+                                "Relate answers to real projects you've worked on. Specifics impress more than theory."}
+                            {dayItem.day === 5 &&
+                                "Treat this like the real thing. Take a breath, stay calm, and be yourself."}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default BootcampDay;
+
+
+================================================================================
+File: frontend\frontend\src\BootcampRoadmap.jsx
+================================================================================
+
+const dayIcons = ["💬", "🧠", "🛠️", "⚙️", "🎯"];
+
+const BootcampRoadmap = ({ plan, completedDays, onStartDay, onBack }) => {
+    const { role, total_days, plan: days } = plan;
+
+    return (
+        <div className="bootcamp-roadmap-page">
+            <div className="roadmap-header">
+                <button className="back-btn" onClick={onBack}>
+                    ← Back
+                </button>
+                <div className="roadmap-title-block">
+                    <h1>Your {total_days}-Day Bootcamp</h1>
+                    <p className="hero-subtitle" style={{ margin: 0 }}>
+                        Role: <strong style={{ color: "#3b82f6" }}>{role}</strong> &nbsp;·&nbsp;
+                        {completedDays.length}/{total_days} days completed
+                    </p>
+                </div>
+                {/* Overall progress bar */}
+                <div className="roadmap-progress-bar">
+                    <div
+                        className="roadmap-progress-fill"
+                        style={{ width: `${(completedDays.length / total_days) * 100}%` }}
+                    />
+                </div>
+            </div>
+
+            <div className="roadmap-timeline">
+                {days.map((dayItem, idx) => {
+                    const dayNum = dayItem.day;
+                    const isCompleted = completedDays.includes(dayNum);
+                    const isActive = dayNum === 1 || completedDays.includes(dayNum - 1);
+                    const isLocked = !isCompleted && !isActive;
+                    const isCurrent = isActive && !isCompleted;
+
+                    return (
+                        <div
+                            key={dayNum}
+                            className={`roadmap-day-card ${isCompleted ? "day-done" : ""} ${isCurrent ? "day-current" : ""} ${isLocked ? "day-locked" : ""}`}
+                        >
+                            {/* Connector line */}
+                            {idx < days.length - 1 && (
+                                <div className={`timeline-connector ${isCompleted ? "connector-done" : ""}`} />
+                            )}
+
+                            {/* Day Status Circle */}
+                            <div className={`day-status-circle ${isCompleted ? "circle-done" : isCurrent ? "circle-current" : "circle-locked"}`}>
+                                {isCompleted ? "✓" : dayIcons[idx]}
+                            </div>
+
+                            {/* Day Info */}
+                            <div className="day-info">
+                                <div className="day-info-header">
+                                    <span className="day-number-tag">Day {dayNum}</span>
+                                    {isCompleted && <span className="day-badge done-badge">✅ Complete</span>}
+                                    {isCurrent && <span className="day-badge current-badge">● Today</span>}
+                                    {isLocked && <span className="day-badge locked-badge">🔒 Locked</span>}
+                                </div>
+                                <h3 className="day-card-title">{dayItem.title}</h3>
+                                <p className="day-card-focus">{dayItem.focus}</p>
+                                <p className="day-card-questions">
+                                    {dayItem.questions.length} questions
+                                </p>
+                            </div>
+
+                            {/* Action Button */}
+                            <div className="day-action">
+                                {isCompleted && (
+                                    <button
+                                        className="day-action-btn retry-btn"
+                                        onClick={() => onStartDay(dayItem)}
+                                    >
+                                        Retry
+                                    </button>
+                                )}
+                                {isCurrent && (
+                                    <button
+                                        className="day-action-btn start-day-btn"
+                                        onClick={() => onStartDay(dayItem)}
+                                    >
+                                        Start →
+                                    </button>
+                                )}
+                                {isLocked && (
+                                    <button className="day-action-btn locked-btn" disabled>
+                                        Locked
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+
+            {completedDays.length === total_days && (
+                <div className="bootcamp-complete-banner fade-in">
+                    <h2>🎉 Bootcamp Complete!</h2>
+                    <p>You've finished all {total_days} days of preparation. Good luck with your interview!</p>
+                    <button className="begin-btn" style={{ maxWidth: "280px", margin: "0 auto" }} onClick={onBack}>
+                        Start a New Bootcamp
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default BootcampRoadmap;
+
+
+================================================================================
+File: frontend\frontend\src\BootcampSetup.jsx
+================================================================================
+
+import { useState } from "react";
+import axios from "axios";
+
+const BootcampSetup = ({ onPlanGenerated, onBack }) => {
+    const [jobRole, setJobRole] = useState("");
+    const [days, setDays] = useState(5);
+    const [file, setFile] = useState(null);
+    const [fileName, setFileName] = useState("No file chosen");
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState("");
+
+    const dayDescriptions = {
+        1: "Quick crash course – HR & behavioral only",
+        2: "HR basics + Core technical concepts",
+        3: "HR + Technical + Problem solving",
+        4: "Full prep minus the final mock",
+        5: "Complete 5-day bootcamp (recommended)",
+    };
+
+    const handleGenerate = async () => {
+        if (!jobRole.trim()) {
+            setError("⚠️ Please enter a Target Job Role.");
+            return;
+        }
+        setError("");
+        setLoading(true);
+
+        try {
+            let resumeText = "";
+            let generatedResumeQs = [];
+
+            if (file) {
+                resumeText = `Resume uploaded: ${file.name}`;
+
+                // 1. Upload resume to set context for questions
+                try {
+                    const ctxFormData = new FormData();
+                    ctxFormData.append("job_role", jobRole);
+                    ctxFormData.append("file", file);
+                    await axios.post("http://127.0.0.1:8000/upload_resume", ctxFormData, {
+                        headers: { "Content-Type": "multipart/form-data" },
+                    });
+
+                    // 2. Generate resume questions
+                    const qRes = await axios.post("http://127.0.0.1:8000/generate_resume_questions");
+                    if (qRes.data.status === "success" && qRes.data.questions?.length > 0) {
+                        generatedResumeQs = qRes.data.questions;
+                    }
+                } catch (err) {
+                    console.warn("Could not generate resume questions:", err);
+                }
+            }
+
+            // 3. Generate the bootcamp plan
+            const formData = new FormData();
+            formData.append("job_role", jobRole);
+            formData.append("days", days);
+            formData.append("resume_text", resumeText);
+
+            const response = await axios.post(
+                "http://127.0.0.1:8000/generate_bootcamp_plan",
+                formData,
+                { headers: { "Content-Type": "multipart/form-data" } }
+            );
+
+            if (response.data.status === "success") {
+                onPlanGenerated(response.data.plan, jobRole, generatedResumeQs);
+            } else {
+                setError(`❌ ${response.data.message || "Failed to generate plan."}`);
+            }
+        } catch (err) {
+            console.error(err);
+            setError("❌ Network error. Make sure the backend is running.");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="bootcamp-setup-page">
+            <div className="hero-section" style={{ paddingBottom: "20px" }}>
+                <h1>🚀 AI Interview Bootcamp</h1>
+                <p className="hero-subtitle">
+                    Tell us your target role and interview date. We'll generate a
+                    personalized day-by-day preparation roadmap.
+                </p>
+            </div>
+
+            <div className="session-card bootcamp-card">
+                <div className="session-card-header">
+                    <div className="header-icon">🗓️</div>
+                    <h2>Configure Your Bootcamp</h2>
+                </div>
+
+                <div className="bootcamp-form">
+                    {/* Job Role */}
+                    <div className="form-group">
+                        <label className="form-label">Target Job Role</label>
+                        <input
+                            type="text"
+                            placeholder="e.g. Python Developer, Data Scientist, Frontend Engineer"
+                            value={jobRole}
+                            onChange={(e) => setJobRole(e.target.value)}
+                            onKeyDown={(e) => e.key === "Enter" && handleGenerate()}
+                        />
+                    </div>
+
+                    {/* Days Slider */}
+                    <div className="form-group">
+                        <label className="form-label">Days Until Interview</label>
+                        <div className="days-slider-wrapper">
+                            <div className="days-display">
+                                <span className="days-number">{days}</span>
+                                <span className="days-label">
+                                    {days === 1 ? "day" : "days"}
+                                </span>
+                            </div>
+                            <input
+                                type="range"
+                                min="1"
+                                max="5"
+                                value={days}
+                                onChange={(e) => setDays(parseInt(e.target.value))}
+                                className="days-slider"
+                            />
+                            <div className="slider-ticks">
+                                {[1, 2, 3, 4, 5].map((d) => (
+                                    <span
+                                        key={d}
+                                        className={`tick ${d <= days ? "tick-active" : ""}`}
+                                        onClick={() => setDays(d)}
+                                    >
+                                        {d}
+                                    </span>
+                                ))}
+                            </div>
+                        </div>
+                        <p className="days-description">{dayDescriptions[days]}</p>
+                    </div>
+
+                    {/* Resume (Optional) */}
+                    <div className="form-group">
+                        <label className="form-label">Resume (Optional)</label>
+                        <div
+                            className="file-upload-wrapper"
+                            onClick={() =>
+                                document.getElementById("bootcamp-resume-input").click()
+                            }
+                        >
+                            <span className="file-label">Choose File</span>
+                            <span className="file-name">{fileName}</span>
+                            <input
+                                id="bootcamp-resume-input"
+                                type="file"
+                                accept=".pdf"
+                                onChange={(e) => {
+                                    setFile(e.target.files[0]);
+                                    setFileName(e.target.files[0]?.name || "No file chosen");
+                                }}
+                            />
+                        </div>
+                        <p style={{ fontSize: "0.78rem", color: "#555", margin: "4px 0 0" }}>
+                            Upload your resume for more tailored questions
+                        </p>
+                    </div>
+
+                    {error && <p className="bootcamp-error">{error}</p>}
+
+                    {/* Day Preview */}
+                    <div className="day-preview-strip">
+                        {Array.from({ length: days }, (_, i) => i + 1).map((d) => {
+                            const titles = [
+                                "HR & Behavioral",
+                                "Core Technical",
+                                "Problem Solving",
+                                "Advanced Tech",
+                                "Full Mock",
+                            ];
+                            const icons = ["💬", "🧠", "🛠️", "⚙️", "🎯"];
+                            return (
+                                <div key={d} className="day-preview-item">
+                                    <span className="day-preview-icon">{icons[d - 1]}</span>
+                                    <span className="day-preview-label">Day {d}</span>
+                                    <span className="day-preview-title">{titles[d - 1]}</span>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    <div className="bootcamp-actions">
+                        <button className="back-btn" onClick={onBack}>
+                            ← Back
+                        </button>
+                        <button
+                            className="begin-btn bootcamp-generate-btn"
+                            onClick={handleGenerate}
+                            disabled={loading}
+                        >
+                            {loading ? (
+                                <>
+                                    <span className="spinner" /> Generating Roadmap...
+                                </>
+                            ) : (
+                                <>Generate My {days}-Day Roadmap &nbsp;›</>
+                            )}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default BootcampSetup;
+
+
+================================================================================
+File: frontend\frontend\src\index.css
+================================================================================
+
+:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+
+a:hover {
+  color: #535bf2;
+}
+
+body {
+  margin: 0;
+
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+
+button:hover {
+  border-color: #646cff;
+}
+
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+
+  a:hover {
+    color: #747bff;
+  }
+
+  button {
+    background-color: #f9f9f9;
+  }
+}
+
+================================================================================
+File: frontend\frontend\src\main.jsx
+================================================================================
+
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error("React Error Boundary caught:", error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, color: 'white', background: '#1a1a2e' }}>
+          <h1>⚠️ Something went wrong</h1>
+          <pre style={{ color: '#ff6b6b', whiteSpace: 'pre-wrap' }}>
+            {this.state.error?.toString()}
+          </pre>
+          <button onClick={() => window.location.reload()} style={{ marginTop: 20, padding: '10px 20px', cursor: 'pointer' }}>
+            Reload Page
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+createRoot(document.getElementById('root')).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>,
+)
+
+
+================================================================================
+File: frontend\frontend\src\PracticeSession.jsx
+================================================================================
+
+import { useState, useRef, useEffect } from "react";
+import { useReactMediaRecorder } from "react-media-recorder";
+import axios from "axios";
+
+const VideoPreview = ({ stream }) => {
+    const videoRef = useRef(null);
+    useEffect(() => {
+        if (videoRef.current && stream) videoRef.current.srcObject = stream;
+    }, [stream]);
+    if (!stream) return null;
+    return <video ref={videoRef} autoPlay muted />;
+};
+
+const PracticeSession = ({ onBack }) => {
+    const [analysis, setAnalysis] = useState(null);
+    const [emotionData, setEmotionData] = useState(null);
+    const [eyeTrackingData, setEyeTrackingData] = useState(null);
+    const [drowsinessData, setDrowsinessData] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [errorMessage, setErrorMessage] = useState(null);
+    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [resumeQuestions, setResumeQuestions] = useState([]);
+    const [loadingResumeQ, setLoadingResumeQ] = useState(false);
+    const [jobRole, setJobRole] = useState("");
+    const [file, setFile] = useState(null);
+    const [fileName, setFileName] = useState("No file chosen");
+    const [setupDone, setSetupDone] = useState(false);
+    const [questions, setQuestions] = useState([
+        "Tell me about yourself.",
+        "What is your biggest weakness?",
+        "Why should we hire you?",
+        "Describe a challenging technical problem you solved.",
+        "Where do you see yourself in 5 years?"
+    ]);
+    const [selectedQuestion, setSelectedQuestion] = useState("Tell me about yourself.");
+
+    const handleResumeUpload = async () => {
+        if (!jobRole) { setErrorMessage("⚠️ Please enter a Target Job Role"); return; }
+        const formData = new FormData();
+        formData.append("job_role", jobRole);
+        if (file) formData.append("file", file);
+        try {
+            setLoading(true);
+            setErrorMessage(null);
+            await axios.post("http://127.0.0.1:8000/upload_resume", formData, {
+                headers: { "Content-Type": "multipart/form-data" },
+            });
+            setLoading(false);
+            setSetupDone(true);
+            if (file) fetchResumeQuestions();
+        } catch (error) {
+            setLoading(false);
+            setErrorMessage(error.message ? `❌ Network Error: ${error.message}` : "❌ Setup failed. Is the backend running?");
+        }
+    };
+
+    const fetchResumeQuestions = async () => {
+        setLoadingResumeQ(true);
+        try {
+            const res = await axios.post("http://127.0.0.1:8000/generate_resume_questions");
+            if (res.data.status === "success" && res.data.questions.length > 0)
+                setResumeQuestions(res.data.questions);
+        } catch (e) { console.warn(e); }
+        finally { setLoadingResumeQ(false); }
+    };
+
+    const handleOnStop = async (blobUrl, blob) => {
+        setLoading(true);
+        setErrorMessage(null);
+        setAnalysis(null); setEmotionData(null); setEyeTrackingData(null); setDrowsinessData(null);
+        window.speechSynthesis.cancel();
+        try {
+            const videoFile = new File([blob], "interview.webm", { type: "video/webm" });
+            const formData = new FormData();
+            formData.append("file", videoFile);
+            formData.append("question", selectedQuestion);
+            const response = await axios.post("http://127.0.0.1:8000/process-video", formData,
+                { headers: { "Content-Type": "multipart/form-data" } });
+            if (response.data.status === "error" || response.data.error) {
+                const msg = response.data.message || response.data.error || "Unknown error";
+                const isQuota = msg.toLowerCase().includes("quota") || msg.includes("429");
+                setErrorMessage(isQuota
+                    ? "🔑 Gemini API daily quota exceeded. Get a free new key at aistudio.google.com and update your .env file."
+                    : `❌ Backend Error: ${msg}`);
+                return;
+            }
+            setAnalysis(response.data.ai_analysis);
+            if (response.data.emotion_analysis && !response.data.emotion_analysis.error) setEmotionData(response.data.emotion_analysis);
+            if (response.data.eye_tracking && !response.data.eye_tracking.error) setEyeTrackingData(response.data.eye_tracking);
+            if (response.data.drowsiness && !response.data.drowsiness.error) setDrowsinessData(response.data.drowsiness);
+        } catch (err) {
+            console.error(err);
+            setErrorMessage("❌ Could not connect to backend. Make sure uvicorn is running on port 8000.");
+        }
+        finally { setLoading(false); }
+    };
+
+    // useReactMediaRecorder is now ONLY mounted when PracticeSession is rendered
+    const { status, startRecording, stopRecording, mediaBlobUrl, previewStream } =
+        useReactMediaRecorder({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: true,
+            blobPropertyBag: { type: "video/webm" },
+            videoBitsPerSecond: 600000,
+            audioBitsPerSecond: 128000,
+            onStop: handleOnStop
+        });
+
+    const speakText = (text) => {
+        window.speechSynthesis.cancel();
+        if (isSpeaking) {
+            setIsSpeaking(false);
+            return;
+        }
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.onend = () => setIsSpeaking(false);
+        window.speechSynthesis.speak(utterance);
+        setIsSpeaking(true);
+    };
+
+    useEffect(() => {
+        if (setupDone && selectedQuestion) {
+            setTimeout(() => window.speechSynthesis.speak(new SpeechSynthesisUtterance(selectedQuestion)), 500);
+        }
+    }, [selectedQuestion, setupDone]);
+
+    // ── SETUP SCREEN ────────────────────────────────────────────────────────────
+    if (!setupDone) {
+        return (
+            <div className="hero-section">
+                <h1>Configure Your Interview</h1>
+                <p className="hero-subtitle">
+                    Practice with our AI-powered coach. Get real-time feedback on your tone, confidence, and answers.
+                </p>
+                <div className="session-card">
+                    <div className="session-card-header">
+                        <div className="header-icon">🎬</div>
+                        <h2>Configure Session</h2>
+                    </div>
+                    <div className="session-card-body">
+                        <div className="form-section">
+                            <div className="form-group">
+                                <label className="form-label">Target Job Role</label>
+                                <input type="text" placeholder="e.g. Senior React Developer" value={jobRole}
+                                    onChange={(e) => setJobRole(e.target.value)}
+                                    onKeyDown={(e) => e.key === "Enter" && handleResumeUpload()} />
+                            </div>
+                            <div className="form-group">
+                                <label className="form-label">Resume (Optional)</label>
+                                <div className="file-upload-wrapper" onClick={() => document.getElementById('resume-input').click()}>
+                                    <span className="file-label">Choose File</span>
+                                    <span className="file-name">{fileName}</span>
+                                    <input id="resume-input" type="file" accept=".pdf"
+                                        onChange={(e) => { setFile(e.target.files[0]); setFileName(e.target.files[0]?.name || "No file chosen"); }} />
+                                </div>
+                            </div>
+                        </div>
+                        <div className="action-section">
+                            <p>Ready to start? We'll generate questions based on your role.</p>
+                            <button className="begin-btn" onClick={handleResumeUpload} disabled={loading}>
+                                {loading ? "Setting up..." : <>Begin Interview &nbsp;›</>}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // ── INTERVIEW SCREEN ─────────────────────────────────────────────────────────
+    return (
+        <div className="interview-wrapper">
+            <div className="interview-layout">
+                <div className="left-panel">
+                    <div className="current-question-display">
+                        <small>Current Topic</small>
+                        <h2>"{selectedQuestion}"</h2>
+                    </div>
+                    <div className="video-box">
+                        {status === "idle" && <div className="placeholder-text">Ready? Press Start below.</div>}
+                        {status === "recording" && (
+                            <div className="live-preview">
+                                <div className="rec-dot">🔴 REC</div>
+                                <VideoPreview stream={previewStream} />
+                            </div>
+                        )}
+                        {status === "stopped" && mediaBlobUrl && !loading && (
+                            <video src={mediaBlobUrl} controls autoPlay />
+                        )}
+                    </div>
+                    <div className="controls">
+                        {status !== "recording" && !loading && (
+                            <button onClick={startRecording} className="start-btn">🔴 Start Answer</button>
+                        )}
+                        {status === "recording" && (
+                            <button onClick={stopRecording} className="stop-btn">⏹ Stop & Submit</button>
+                        )}
+                    </div>
+                    {loading && <div className="loading-text">🧠 AI is analyzing your confidence, tone, and content...</div>}
+
+                    {errorMessage && (
+                        <div className="error-banner" style={{
+                            background: "rgba(220,38,38,0.12)",
+                            border: "1px solid rgba(220,38,38,0.4)",
+                            borderRadius: "10px",
+                            padding: "14px 18px",
+                            margin: "12px 0",
+                            color: "#fca5a5",
+                            fontSize: "0.9rem",
+                            lineHeight: 1.5
+                        }}>
+                            {errorMessage}
+                            {errorMessage.includes("quota") && (
+                                <><br /><a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer"
+                                    style={{ color: "#60a5fa", fontWeight: 600 }}>→ Get a free API key here</a></>
+                            )}
+                        </div>
+                    )}
+
+
+                    {analysis && (
+                        <div className="results fade-in">
+                            <div className="score-header">
+                                <h2>Score: {analysis.rating}/100</h2>
+                                <button onClick={() => speakText(`You scored ${analysis.rating}. ${analysis.feedback}`)} className="speak-btn">
+                                    {isSpeaking ? "⏹️ Stop" : "🔊 Listen"}
+                                </button>
+                            </div>
+                            <p><strong>💡 Feedback:</strong> {analysis.feedback}</p>
+                            <div className="improvement-box">
+                                <p><strong>✨ Better Way to Say It:</strong> "{analysis.improved_answer}"</p>
+                            </div>
+                            {analysis.follow_up_question && (
+                                <button className="follow-up-btn" onClick={() => {
+                                    setQuestions(prev => [...prev, analysis.follow_up_question]);
+                                    setSelectedQuestion(analysis.follow_up_question);
+                                    setAnalysis(null);
+                                }}>
+                                    ➡️ Try Follow-up: "{analysis.follow_up_question}"
+                                </button>
+                            )}
+                        </div>
+                    )}
+
+                    {emotionData && (
+                        <div className="results fade-in emotion-box">
+                            <div className="score-header">
+                                <h3>🎭 Facial Analysis</h3>
+                                <span className="emotion-badge">{emotionData.dominant_emotion}</span>
+                            </div>
+                            <div className="emotion-feedback">
+                                {(emotionData.coaching_feedback || []).map((tip, i) => <p key={i}>💡 {tip}</p>)}
+                            </div>
+                            <div className="emotion-breakdown">
+                                <small>Emotion Breakdown:</small>
+                                <div className="graph-container">
+                                    {Object.entries(emotionData.emotion_breakdown || {}).map(([emotion, score]) =>
+                                        score > 5 && <div key={emotion} className="graph-bar" style={{ width: `${score}%` }}>{emotion} ({score}%)</div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {eyeTrackingData && !eyeTrackingData.error && (
+                        <div className="results fade-in eye-tracking-box">
+                            <div className="score-header">
+                                <h3>👁️ Eye Contact Analysis</h3>
+                                <span className="eye-badge">{eyeTrackingData.gaze_stability}</span>
+                            </div>
+                            <div className="eye-metrics">
+                                <div className="metric-item"><span className="metric-label">Eye Contact</span><span className="metric-value">{eyeTrackingData.eye_contact_percentage}%</span></div>
+                                <div className="metric-item"><span className="metric-label">Looking Away</span><span className="metric-value">{eyeTrackingData.looking_away_count}×</span></div>
+                            </div>
+                            <div className="eye-feedback">{(eyeTrackingData.coaching_feedback || []).map((tip, i) => <p key={i}>💡 {tip}</p>)}</div>
+                            <div className="eye-contact-bar">
+                                <small>Eye Contact Progress:</small>
+                                <div className="progress-bar-container">
+                                    <div className="progress-bar-fill" style={{ width: `${eyeTrackingData.eye_contact_percentage}%`, backgroundColor: eyeTrackingData.eye_contact_percentage >= 70 ? '#16a34a' : eyeTrackingData.eye_contact_percentage >= 50 ? '#ca8a04' : '#dc2626' }}>
+                                        {eyeTrackingData.eye_contact_percentage}%
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {drowsinessData && !drowsinessData.error && (
+                        <div className="results fade-in drowsiness-box">
+                            <div className="score-header">
+                                <h3>😴 Alertness Analysis</h3>
+                                <span className={`drowsiness-badge ${drowsinessData.drowsiness_level === 'Alert' ? 'badge-alert' : drowsinessData.drowsiness_level === 'Mild Drowsiness' ? 'badge-mild' : drowsinessData.drowsiness_level === 'Moderate Drowsiness' ? 'badge-moderate' : 'badge-severe'}`}>
+                                    {drowsinessData.drowsiness_level}
+                                </span>
+                            </div>
+                            <div className="drowsiness-metrics">
+                                <div className="metric-item"><span className="metric-label">Alertness</span><span className="metric-value">{drowsinessData.alertness_score}/100</span></div>
+                                <div className="metric-item"><span className="metric-label">Yawns</span><span className="metric-value">{drowsinessData.yawn_count}</span></div>
+                                <div className="metric-item"><span className="metric-label">Blink Rate</span><span className="metric-value">{drowsinessData.blink_rate}/min</span></div>
+                                <div className="metric-item"><span className="metric-label">Eyes Closed</span><span className="metric-value">{drowsinessData.perclos}%</span></div>
+                            </div>
+                            <div className="drowsiness-feedback">{(drowsinessData.coaching_feedback || []).map((tip, i) => <p key={i}>{tip}</p>)}</div>
+                        </div>
+                    )}
+                </div>
+
+                <div className="right-panel">
+                    <h3>📌 Interview Questions</h3>
+                    <div className="questions-list">
+                        {questions.map((q, i) => (
+                            <div key={i} className={`question-item ${selectedQuestion === q ? 'active' : ''}`}
+                                onClick={() => { setSelectedQuestion(q); setAnalysis(null); window.speechSynthesis.cancel(); }}>
+                                <h4>{i + 1}. {q}</h4>
+                            </div>
+                        ))}
+                    </div>
+                    {loadingResumeQ && <div className="resume-questions-section"><h3>📄 Resume Questions</h3><p className="loading-resume-q">Generating...</p></div>}
+                    {resumeQuestions.length > 0 && (
+                        <div className="resume-questions-section">
+                            <h3>📄 Resume-Based Questions</h3>
+                            <p className="resume-q-hint">Generated from your resume & target role</p>
+                            <div className="questions-list">
+                                {resumeQuestions.map((q, i) => (
+                                    <div key={`resume-${i}`} className={`question-item resume-q ${selectedQuestion === q ? 'active' : ''}`}
+                                        onClick={() => { setSelectedQuestion(q); setAnalysis(null); window.speechSynthesis.cancel(); }}>
+                                        <h4>{i + 1}. {q}</h4>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default PracticeSession;
+
